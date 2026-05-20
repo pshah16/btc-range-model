@@ -657,13 +657,13 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
                   f"${daily['pred_high']:,.0f}",
                   delta=(f"+{(daily['pred_high']/daily['close_asof']-1)*100:.2f}% vs close"))
         d1.caption(
-            f"±2.5 % band ${daily['pred_high']*0.975:,.0f} – ${daily['pred_high']*1.025:,.0f}"
+            f"±1.5 % band ${daily['pred_high']*0.985:,.0f} – ${daily['pred_high']*1.015:,.0f}"
         )
         d2.metric("Predicted DAILY LOW",
                   f"${daily['pred_low']:,.0f}",
                   delta=(f"{(daily['pred_low']/daily['close_asof']-1)*100:.2f}% vs close"))
         d2.caption(
-            f"±2.5 % band ${daily['pred_low']*0.975:,.0f} – ${daily['pred_low']*1.025:,.0f}"
+            f"±1.5 % band ${daily['pred_low']*0.985:,.0f} – ${daily['pred_low']*1.015:,.0f}"
         )
 
     # ─────────────────────────── walk-forward look-back ───────────────────
@@ -857,7 +857,7 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
         # ±2.5% bands around HIGH (green) and LOW (red).  When the ±2.5%
         # zones would overlap, we CLIP each at the midpoint between the two
         # predictions so the green and red never blend into yellow.
-        DAILY_BAND_PCT = 0.025
+        DAILY_BAND_PCT = 0.015
         mid = (daily["pred_high"] + daily["pred_low"]) / 2
         hi_raw_dn = daily["pred_high"] * (1 - DAILY_BAND_PCT)
         hi_raw_up = daily["pred_high"] * (1 + DAILY_BAND_PCT)
