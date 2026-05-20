@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ipynb_checkpoints/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Local logs / scratch
+*.log
+/tmp/
+
+# Streamlit
+.streamlit/
+
+# Large reproducible-from-API/script data — regenerable via src/ scripts
+data/binance_hourly_btc.csv
+data/raw_hourly.csv
+data/raw_ct.csv
+data/features_ct.csv
+legacy/data/raw.csv
+legacy/data/features.csv
+
+# joblib backups from prior retrain runs — not needed in repo
+legacy/backups/*.bak
+
+# Bulky legacy model artefact (35 MB), regeneratable via legacy/train_7d_model.py
+legacy/models/inference_assets_7d.joblib
