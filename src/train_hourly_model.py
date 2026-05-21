@@ -72,19 +72,32 @@ print(f"Joined hourly frame: {df.shape}")
 print(f"  NaN counts (top 10): {df.isna().sum().sort_values(ascending=False).head(10).to_dict()}")
 
 # Fear & Greed (daily) → forward-fill to hourly
+#
+# IMPORTANT (causality): alternative.me publishes one F&G value per UTC
+# date and *updates it throughout the day* (the latest record carries a
+# `time_until_update` countdown). That means the value stamped at
+# 2026-05-21 00:00 UTC is recomputed during the day with information from
+# later hours of 2026-05-21.  Using it at hour 14:00 UTC of the same date
+# would be look-ahead.
+#
+# Fix: lag the F&G series by 1 day so each hour t on calendar date D uses
+# the value finalised for date D-1 (which became immutable when the next
+# day's record was created).
 print("\nFetching Fear & Greed daily ...")
 r = requests.get("https://api.alternative.me/fng/?limit=0", timeout=20).json()
 fng = pd.DataFrame(r["data"])
 fng["dt"]    = pd.to_datetime(fng["timestamp"].astype(int), unit="s").dt.normalize()
 fng["value"] = fng["value"].astype(int)
 fng = fng[["dt","value"]].sort_values("dt").drop_duplicates("dt").set_index("dt")
+fng = fng.shift(1, freq="D")   # ← 1-day causal lag (anti-leak)
 # Forward-fill to hourly grid
 fng_hourly = fng.reindex(grid.normalize()).ffill()
 fng_hourly.index = grid
 df["fng"]     = fng_hourly["value"].values
 df["fng_d7"]  = pd.Series(df["fng"].values, index=grid).diff(24*7).values
 df["fng_d24"] = pd.Series(df["fng"].values, index=grid).diff(24).values
-print(f"  FNG joined. Latest={df['fng'].iloc[-1]}  range=[{df['fng'].min()}, {df['fng'].max()}]")
+print(f"  FNG joined (lagged 1d). Latest={df['fng'].iloc[-1]}  "
+      f"range=[{df['fng'].min()}, {df['fng'].max()}]")
 
 # Drop rows where BTC is missing (rare)
 df = df.dropna(subset=["btc_close"])
@@ -173,53 +186,70 @@ print(data.isna().sum().sort_values(ascending=False).head(15).to_string())
 data = data.dropna()
 print(f"Feature matrix: {data.shape}   features={data.shape[1]-3}")
 
-# ── 3. TRAIN/TEST SPLIT ───────────────────────────────────────────────── #
-TODAY = pd.Timestamp(datetime.now(timezone.utc).date())
-test_start = TODAY - pd.Timedelta(days=60)   # last 60 days as test
-train = data.loc[: test_start - pd.Timedelta(hours=1)]
+# ── 3. TRAIN / VAL / TEST  SPLIT  (with 1-hour embargo for shift(-1) target) #
+#
+#   TRAIN  → fit each candidate model
+#   VAL    → pick the winner (no peeking at TEST)
+#   TEST   → final, untouched evaluation
+#
+# Embargo = 1 hour: the last training row's target is the first val row's
+# close, so we drop that row to keep the splits causally disjoint.
+TODAY        = pd.Timestamp(datetime.now(timezone.utc).date())
+TEST_DAYS    = 45
+VAL_DAYS     = 15
+EMBARGO_HRS  = 1   # = forecast horizon
+
+test_start  = TODAY      - pd.Timedelta(days=TEST_DAYS)
+val_start   = test_start - pd.Timedelta(days=VAL_DAYS)
+train_end   = val_start  - pd.Timedelta(hours=EMBARGO_HRS)
+val_end     = test_start - pd.Timedelta(hours=EMBARGO_HRS)
+
+train = data.loc[: train_end]
+val   = data.loc[val_start: val_end]
 test  = data.loc[test_start:]
 feat_cols = [c for c in data.columns if c not in ("y_ret","close","next_close")]
 print(f"TRAIN  {train.index.min()} → {train.index.max()}  n={len(train)}")
-print(f"TEST   {test.index.min()}  → {test.index.max()}   n={len(test)}")
+print(f"VAL    {val.index.min()}   → {val.index.max()}    n={len(val)}  "
+      f"(embargo {EMBARGO_HRS}h before val_start)")
+print(f"TEST   {test.index.min()}  → {test.index.max()}   n={len(test)}  "
+      f"(embargo {EMBARGO_HRS}h before test_start)")
 
-X_tr, X_te = train[feat_cols], test[feat_cols]
-y_tr,  y_te  = train["y_ret"], test["y_ret"]
-close_te    = test["close"].values
-next_close_true = test["next_close"].values
+X_tr, X_va, X_te = train[feat_cols], val[feat_cols], test[feat_cols]
+y_tr,  y_va,  y_te = train["y_ret"], val["y_ret"], test["y_ret"]
+close_va, next_va = val["close"].values,  val["next_close"].values
+close_te, next_close_true = test["close"].values, test["next_close"].values
 
-# ── 4. BASELINES ──────────────────────────────────────────────────────── #
-def evaluate(name, pred_ret):
-    pred_close = close_te * np.exp(pred_ret)
-    err = pred_close - next_close_true
-    rel = np.abs(err) / next_close_true
-    direction_acc = np.mean(np.sign(pred_ret) == np.sign(y_te.values)) * 100
+# ── 4. EVAL HELPERS ───────────────────────────────────────────────────── #
+def _evaluate(name, y_true, close_, next_, pred_ret):
+    pred_close = close_ * np.exp(pred_ret)
+    rel = np.abs(pred_close - next_) / next_
+    direction_acc = np.mean(np.sign(pred_ret) == np.sign(y_true)) * 100
     return dict(
         model      = name,
-        MAPE_pct   = (rel.mean() * 100),
-        hit3_pct   = (rel <= 0.03).mean() * 100,
-        hit1_pct   = (rel <= 0.01).mean() * 100,
-        hit05_pct  = (rel <= 0.005).mean() * 100,
-        dir_acc_pct= direction_acc,
-        R2_return  = r2_score(y_te, pred_ret),
-        MAE_USD    = mean_absolute_error(next_close_true, pred_close),
-        RMSE_USD   = np.sqrt(mean_squared_error(next_close_true, pred_close)),
+        MAPE_pct   = float(rel.mean() * 100),
+        hit3_pct   = float((rel <= 0.03).mean() * 100),
+        hit1_pct   = float((rel <= 0.01).mean() * 100),
+        hit05_pct  = float((rel <= 0.005).mean() * 100),
+        dir_acc_pct= float(direction_acc),
+        R2_return  = float(r2_score(y_true, pred_ret)),
+        MAE_USD    = float(mean_absolute_error(next_, pred_close)),
+        RMSE_USD   = float(np.sqrt(mean_squared_error(next_, pred_close))),
     )
+eval_va = lambda name, p: _evaluate(name, y_va.values, close_va, next_va,  p)
+eval_te = lambda name, p: _evaluate(name, y_te.values, close_te, next_close_true, p)
 
-baselines = []
-baselines.append(evaluate("A. zero return (close→close)",  np.zeros_like(y_te.values)))
-baselines.append(evaluate(f"B. const mean return ({y_tr.mean():.6f})",
-                          np.full_like(y_te.values, y_tr.mean())))
-baselines.append(evaluate("C. last-1h return persistence",
-                          X_te["ret_1h"].values))
-
-print("\n>>> BASELINES on test set:")
-for r in baselines:
+# Sanity baselines (reported on VAL — for context, not selection)
+print("\n>>> VAL BASELINES (for context):")
+for r in (
+    eval_va("A. zero return (close→close)",  np.zeros_like(y_va.values)),
+    eval_va(f"B. const mean return ({y_tr.mean():.6f})",
+            np.full_like(y_va.values, y_tr.mean())),
+    eval_va("C. last-1h return persistence", X_va["ret_1h"].values),
+):
     print(f"  {r['model']:38s}  MAPE={r['MAPE_pct']:5.2f}%  "
-          f"hit3={r['hit3_pct']:5.1f}%  hit1={r['hit1_pct']:5.1f}%  "
-          f"hit0.5={r['hit05_pct']:4.1f}%  dir_acc={r['dir_acc_pct']:5.2f}%  "
-          f"R2={r['R2_return']:6.3f}")
+          f"dir_acc={r['dir_acc_pct']:5.2f}%  R2={r['R2_return']:6.3f}")
 
-# ── 5. TRAIN MODELS ───────────────────────────────────────────────────── #
+# ── 5. TRAIN MODELS, PICK ON VAL ─────────────────────────────────────── #
 def mk(model):
     return Pipeline([("sc", StandardScaler()), ("m", model)])
 
@@ -229,26 +259,32 @@ MODELS = {
                 n_estimators=800, max_depth=3, learning_rate=0.02,
                 subsample=0.8, random_state=42)),
 }
-print("\n>>> MODELS on test set:")
-results = {}
+print("\n>>> MODELS — train on TRAIN, score on VAL (selection); TEST untouched:")
+val_results = {}
 for name, m in MODELS.items():
     m.fit(X_tr, y_tr)
-    pred = m.predict(X_te)
-    r = evaluate(name, pred)
-    print(f"  {name:6s}  MAPE={r['MAPE_pct']:5.2f}%  "
-          f"hit3={r['hit3_pct']:5.1f}%  hit1={r['hit1_pct']:5.1f}%  "
-          f"hit0.5={r['hit05_pct']:4.1f}%  dir_acc={r['dir_acc_pct']:5.2f}%  "
-          f"R2={r['R2_return']:6.3f}")
-    results[name] = dict(model=m, pred=pred, metrics=r)
+    pred_va = m.predict(X_va)
+    r = eval_va(name, pred_va)
+    print(f"  {name:6s} VAL  MAPE={r['MAPE_pct']:5.2f}%  "
+          f"dir_acc={r['dir_acc_pct']:5.2f}%  R2={r['R2_return']:6.3f}")
+    val_results[name] = dict(model=m, pred_va=pred_va, metrics_va=r)
 
-best = max(results.keys(), key=lambda k: results[k]["metrics"]["dir_acc_pct"])
-print(f"\n>>> BEST (by dir_acc): {best}")
-mh = results[best]["model"]
-pred_te = results[best]["pred"]
+best = max(val_results.keys(), key=lambda k: val_results[k]["metrics_va"]["dir_acc_pct"])
+print(f"\n>>> SELECTED on VAL by dir_acc: {best}")
+mh = val_results[best]["model"]
 
-# Residual std on test → 95 % CI
-sigma = float(np.std(y_te.values - pred_te))
-print(f"σ (return space) = {sigma:.5f}  →  95% half-width ≈ ±{1.96*sigma*100:.2f}% of close")
+# Final UNBIASED evaluation on TEST.
+pred_te = mh.predict(X_te)
+test_metrics = eval_te(best, pred_te)
+print(f"\n>>> {best:6s} TEST (unbiased)  MAPE={test_metrics['MAPE_pct']:5.2f}%  "
+      f"hit3={test_metrics['hit3_pct']:5.1f}%  hit1={test_metrics['hit1_pct']:5.1f}%  "
+      f"hit0.5={test_metrics['hit05_pct']:4.1f}%  dir_acc={test_metrics['dir_acc_pct']:5.2f}%  "
+      f"R2={test_metrics['R2_return']:6.3f}")
+
+# σ fit on VAL residuals (not TEST) → CI is unbiased w.r.t. the test set
+sigma = float(np.std(y_va.values - val_results[best]["pred_va"]))
+print(f"σ (return space, from VAL) = {sigma:.5f}  →  "
+      f"95% half-width ≈ ±{1.96*sigma*100:.2f}% of close")
 
 # ── 6. BIG-MOVE DAY EVALUATION ────────────────────────────────────────── #
 print("\n>>> Big-move day analysis ...")
@@ -287,11 +323,21 @@ print(imp.head(15).to_string())
 # ── 8. SAVE ───────────────────────────────────────────────────────────── #
 joblib.dump(dict(
     model=mh, sigma=sigma, feat_cols=feat_cols,
+    best_name=best,
     fng_baseline=int(df["fng"].iloc[-1]),
-    test_start=str(test.index.min()),
-    test_end  =str(test.index.max()),
-    metrics_overall=results[best]["metrics"],
+    train_start=str(train.index.min()),
+    train_end  =str(train.index.max()),
+    val_start  =str(val.index.min()),
+    val_end    =str(val.index.max()),
+    test_start =str(test.index.min()),
+    test_end   =str(test.index.max()),
+    embargo_hours=int(EMBARGO_HRS),
+    metrics_val =val_results[best]["metrics_va"],
+    metrics_test=test_metrics,
     importance=imp,
     big_days=[str(d.date()) for d in big_days],
+    tuning_notes=("Model picked on VAL by dir_acc; σ fit on VAL residuals; "
+                  "TEST untouched until final report. F&G lagged by 1 day "
+                  "to avoid intraday update leakage."),
 ), HOURLY_MODEL)
 print(f"\nSaved inference_assets_hourly.joblib  (best={best})")

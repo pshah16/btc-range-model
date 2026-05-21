@@ -318,21 +318,44 @@ data.to_csv(FEATURES_CT_CSV)
 
 
 # ───────────────────────────────────────────────────────────────────────
-# 5. TRAIN ENSEMBLE  (mirrors retrain_daily_v2.py)
+# 5. SPLIT  TRAIN / VAL / TEST  (with embargo for the 1-day forward target)
+#
+#   TRAIN  → fit the ensemble + direction classifier
+#   VAL    → tune α (climatology blend) and (β_base, r) (direction-head weight)
+#   TEST   → final, untouched evaluation
+#
+# A 1-day embargo gap separates each split so a training row's target
+# (which uses next-bar high/low, i.e. shift(-1)) cannot contain any data
+# from the next split.
 # ───────────────────────────────────────────────────────────────────────
 LATEST = data.index.max()
-test_start = LATEST - pd.DateOffset(months=8)
-train = data.loc[: test_start - pd.Timedelta(days=1)]
-test = data.loc[test_start:]
+TEST_MONTHS  = 6
+VAL_MONTHS   = 2
+EMBARGO_DAYS = 1   # = forecast horizon for daily H/L
+
+test_start  = LATEST     - pd.DateOffset(months=TEST_MONTHS)
+val_start   = test_start - pd.DateOffset(months=VAL_MONTHS)
+train_end   = val_start  - pd.Timedelta(days=EMBARGO_DAYS)
+val_end     = test_start - pd.Timedelta(days=EMBARGO_DAYS)
+
+train = data.loc[: train_end]
+val   = data.loc[val_start: val_end]
+test  = data.loc[test_start:]
 feat_cols = [c for c in data.columns if c not in ("y_hi", "y_lo", "close", "next_high", "next_low")]
-X_tr, X_te = train[feat_cols], test[feat_cols]
-yhi_tr, yhi_te = train["y_hi"], test["y_hi"]
-ylo_tr, ylo_te = train["y_lo"], test["y_lo"]
+X_tr, X_va, X_te = train[feat_cols], val[feat_cols], test[feat_cols]
+yhi_tr, yhi_va, yhi_te = train["y_hi"], val["y_hi"], test["y_hi"]
+ylo_tr, ylo_va, ylo_te = train["y_lo"], val["y_lo"], test["y_lo"]
+close_va = val["close"].values
+hi_true_va = val["next_high"].values
+lo_true_va = val["next_low"].values
 close_te = test["close"].values
 hi_true = test["next_high"].values
 lo_true = test["next_low"].values
 print(f"\n>>> TRAIN {train.index.min().date()} → {train.index.max().date()}  n={len(train)}")
-print(f">>> TEST  {test.index.min().date()}  → {test.index.max().date()}   n={len(test)}")
+print(f">>> VAL   {val.index.min().date()}  → {val.index.max().date()}   n={len(val)}  "
+      f"(embargo {EMBARGO_DAYS}d before val_start)")
+print(f">>> TEST  {test.index.min().date()}  → {test.index.max().date()}   n={len(test)}  "
+      f"(embargo {EMBARGO_DAYS}d before test_start)")
 
 
 def mk(model): return Pipeline([("sc", StandardScaler()), ("m", model)])
@@ -354,46 +377,61 @@ M_GBQUANT = mk(GradientBoostingRegressor(
 print(f"\nTraining individual models (quantile α={ALPHA_QUANT} for QR / GBM-Quantile) …")
 preds = {}
 for name, ctor in [("huber", M_HUBER), ("quant_lin", M_QUANTLR), ("gbm_quant", M_GBQUANT)]:
-    mh = clone(ctor); mh.fit(X_tr, yhi_tr); ph = mh.predict(X_te)
-    ml = clone(ctor); ml.fit(X_tr, ylo_tr); pl = ml.predict(X_te)
-    preds[name] = dict(m_hi=mh, m_lo=ml, ph=ph, pl=pl)
+    mh = clone(ctor); mh.fit(X_tr, yhi_tr)
+    ml = clone(ctor); ml.fit(X_tr, ylo_tr)
+    preds[name] = dict(
+        m_hi=mh, m_lo=ml,
+        ph_va=mh.predict(X_va), pl_va=ml.predict(X_va),
+        ph_te=mh.predict(X_te), pl_te=ml.predict(X_te),
+    )
     print(f"  {name}: fitted")
 
-ens_ph = np.mean([p["ph"] for p in preds.values()], axis=0)
-ens_pl = np.mean([p["pl"] for p in preds.values()], axis=0)
+ens_ph_va = np.mean([p["ph_va"] for p in preds.values()], axis=0)
+ens_pl_va = np.mean([p["pl_va"] for p in preds.values()], axis=0)
+ens_ph_te = np.mean([p["ph_te"] for p in preds.values()], axis=0)
+ens_pl_te = np.mean([p["pl_te"] for p in preds.values()], axis=0)
 
 mu_hi, mu_lo = float(yhi_tr.mean()), float(ylo_tr.mean())
 print(f"\nTraining-set means: hi={mu_hi:.4f}  lo={mu_lo:.4f}")
 
 
-def mape_of(ph, pl):
-    pred_hi = close_te * (1 + np.clip(ph, 0, None))
-    pred_lo = close_te * (1 - np.clip(pl, 0, None))
-    return (np.abs(pred_hi - hi_true) / hi_true).mean() * 100, \
-           (np.abs(pred_lo - lo_true) / lo_true).mean() * 100
+def mape_on(close_, hi_t, lo_t, ph, pl):
+    pred_hi = close_ * (1 + np.clip(ph, 0, None))
+    pred_lo = close_ * (1 - np.clip(pl, 0, None))
+    return ((np.abs(pred_hi - hi_t) / hi_t).mean() * 100,
+            (np.abs(pred_lo - lo_t) / lo_t).mean() * 100)
+
+mape_va = lambda ph, pl: mape_on(close_va, hi_true_va, lo_true_va, ph, pl)
+mape_te = lambda ph, pl: mape_on(close_te, hi_true, lo_true, ph, pl)
 
 
-mh_e, ml_e = mape_of(ens_ph, ens_pl)
-print(f"Pure ensemble:    MAPE_H={mh_e:.3f}%   MAPE_L={ml_e:.3f}%")
-mh_c, ml_c = mape_of(np.full_like(ens_ph, mu_hi), np.full_like(ens_pl, mu_lo))
-print(f"Pure climatology: MAPE_H={mh_c:.3f}%   MAPE_L={ml_c:.3f}%")
+# α tuned on VAL only — TEST stays untouched until final evaluation.
+print("\nValidation baselines:")
+mh_va_e, ml_va_e = mape_va(ens_ph_va, ens_pl_va)
+print(f"  Pure ensemble (val):    MAPE_H={mh_va_e:.3f}%   MAPE_L={ml_va_e:.3f}%")
+mh_va_c, ml_va_c = mape_va(np.full_like(ens_ph_va, mu_hi),
+                           np.full_like(ens_pl_va, mu_lo))
+print(f"  Pure climatology (val): MAPE_H={mh_va_c:.3f}%   MAPE_L={ml_va_c:.3f}%")
 
 best_a_h, best_a_l = 0.0, 0.0
-best_mh, best_ml = 99.0, 99.0
+best_mh_va, best_ml_va = 99.0, 99.0
 for a in np.linspace(0, 1, 21):
-    bh = a * ens_ph + (1 - a) * mu_hi
-    bl = a * ens_pl + (1 - a) * mu_lo
-    mh, ml = mape_of(bh, bl)
-    if mh < best_mh: best_mh, best_a_h = mh, a
-    if ml < best_ml: best_ml, best_a_l = ml, a
+    bh = a * ens_ph_va + (1 - a) * mu_hi
+    bl = a * ens_pl_va + (1 - a) * mu_lo
+    mh, ml = mape_va(bh, bl)
+    if mh < best_mh_va: best_mh_va, best_a_h = mh, a
+    if ml < best_ml_va: best_ml_va, best_a_l = ml, a
 
 alpha_use = (best_a_h + best_a_l) / 2
-print(f"\nBest α HIGH = {best_a_h:.2f} (MAPE_H={best_mh:.3f}%);  "
-      f"Best α LOW = {best_a_l:.2f} (MAPE_L={best_ml:.3f}%);  "
+print(f"\n  Best α HIGH = {best_a_h:.2f} (val MAPE_H={best_mh_va:.3f}%);  "
+      f"Best α LOW = {best_a_l:.2f} (val MAPE_L={best_ml_va:.3f}%);  "
       f"Using shared α = {alpha_use:.2f}")
 
-final_ph = alpha_use * ens_ph + (1 - alpha_use) * mu_hi
-final_pl = alpha_use * ens_pl + (1 - alpha_use) * mu_lo
+# Apply α to both VAL (needed for β tuning that uses post-α ensemble) and TEST.
+final_ph_va = alpha_use * ens_ph_va + (1 - alpha_use) * mu_hi
+final_pl_va = alpha_use * ens_pl_va + (1 - alpha_use) * mu_lo
+final_ph    = alpha_use * ens_ph_te + (1 - alpha_use) * mu_hi
+final_pl    = alpha_use * ens_pl_te + (1 - alpha_use) * mu_lo
 
 # ───────────────────────────────────────────────────────────────────────
 # 5b. DIRECTION HEAD
@@ -408,11 +446,14 @@ final_pl = alpha_use * ens_pl + (1 - alpha_use) * mu_lo
 # ───────────────────────────────────────────────────────────────────────
 print("\n>>> Training direction head (sign of asymmetry y_hi − y_lo) …")
 d_tr = (yhi_tr - ylo_tr) / 2
+d_va = (yhi_va - ylo_va) / 2
 d_te = (yhi_te - ylo_te) / 2
 label_tr = (d_tr > 0).astype(int)
+label_va = (d_va > 0).astype(int)
 label_te = (d_te > 0).astype(int)
 print(f"   train bullish fraction = {label_tr.mean():.3f}  "
       f"(n_bull={int(label_tr.sum())}, n_bear={int((1-label_tr).sum())})")
+print(f"   val   bullish fraction = {label_va.mean():.3f}")
 print(f"   test  bullish fraction = {label_te.mean():.3f}")
 
 dir_clf = Pipeline([
@@ -422,9 +463,12 @@ dir_clf = Pipeline([
         subsample=0.8, random_state=42)),
 ])
 dir_clf.fit(X_tr, label_tr)
+p_bull_va = dir_clf.predict_proba(X_va)[:, 1]
 p_bull_te = dir_clf.predict_proba(X_te)[:, 1]
-clf_acc = float(((p_bull_te > 0.5).astype(int) == label_te).mean())
-print(f"   classifier accuracy on test: {clf_acc*100:.1f}%")
+clf_acc_va = float(((p_bull_va > 0.5).astype(int) == label_va).mean())
+clf_acc    = float(((p_bull_te > 0.5).astype(int) == label_te).mean())
+print(f"   classifier accuracy on val:  {clf_acc_va*100:.1f}%")
+print(f"   classifier accuracy on test: {clf_acc*100:.1f}%   (unbiased — not used for tuning)")
 
 # Calibration: typical asymmetry under each regime (train-only)
 d_bull_mean = float(d_tr[label_tr == 1].mean())
@@ -432,10 +476,13 @@ d_bear_mean = float(d_tr[label_tr == 0].mean())
 print(f"   train d_bull_mean = {d_bull_mean*100:+.3f}%   "
       f"d_bear_mean = {d_bear_mean*100:+.3f}%")
 
-# Baseline ensemble (post-α) decomposition on test
-ens_m_te = (final_ph + final_pl) / 2
-ens_d_te = (final_ph - final_pl) / 2
-# Classifier-driven asymmetry on test
+# Decompose post-α ensemble into half-range m + asymmetry d, on VAL and TEST.
+ens_m_va = (final_ph_va + final_pl_va) / 2
+ens_d_va = (final_ph_va - final_pl_va) / 2
+ens_m_te = (final_ph    + final_pl   ) / 2
+ens_d_te = (final_ph    - final_pl   ) / 2
+# Classifier-driven asymmetry
+d_dir_va = p_bull_va * d_bull_mean + (1 - p_bull_va) * d_bear_mean
 d_dir_te = p_bull_te * d_bull_mean + (1 - p_bull_te) * d_bear_mean
 
 
@@ -443,59 +490,75 @@ d_dir_te = p_bull_te * d_bull_mean + (1 - p_bull_te) * d_bear_mean
 # a strong recent trend, lower the β (trust the direction head more); in chop,
 # stay near β_base. Effective β per row = β_base × (1 − reduction × trend_str).
 TREND_SAT = 0.05
+trend_str_va = np.minimum(np.abs(X_va["ret_5"].values) / TREND_SAT, 1.0)
 trend_str_te = np.minimum(np.abs(X_te["ret_5"].values) / TREND_SAT, 1.0)
 
 
-def _eval_beta_adaptive(beta_base, reduction):
-    beta_eff = beta_base * (1.0 - reduction * trend_str_te)
-    beta_eff = np.clip(beta_eff, 0.0, 1.0)
-    d_blend = beta_eff * ens_d_te + (1 - beta_eff) * d_dir_te
-    yhi_new = ens_m_te + d_blend
-    ylo_new = ens_m_te - d_blend
-    pred_h_b = close_te * (1 + np.clip(yhi_new, 0, None))
-    pred_l_b = close_te * (1 - np.clip(ylo_new, 0, None))
-    mh_b = float((np.abs(pred_h_b - hi_true) / hi_true).mean() * 100)
-    ml_b = float((np.abs(pred_l_b - lo_true) / lo_true).mean() * 100)
-    sign_pred = np.sign(d_blend)
-    sign_act = np.sign(d_te.values)
-    hit = float((sign_pred == sign_act).mean() * 100)
-    return mh_b, ml_b, hit, beta_eff
+def _apply_beta(beta_base, reduction, ens_m, ens_d, d_dir, trend_str,
+                close_, hi_true_, lo_true_, d_actual_):
+    beta_eff = np.clip(beta_base * (1.0 - reduction * trend_str), 0.0, 1.0)
+    d_blend = beta_eff * ens_d + (1 - beta_eff) * d_dir
+    yhi_new = ens_m + d_blend
+    ylo_new = ens_m - d_blend
+    pred_h = close_ * (1 + np.clip(yhi_new, 0, None))
+    pred_l = close_ * (1 - np.clip(ylo_new, 0, None))
+    mh_ = float((np.abs(pred_h - hi_true_) / hi_true_).mean() * 100)
+    ml_ = float((np.abs(pred_l - lo_true_) / lo_true_).mean() * 100)
+    hit = float((np.sign(d_blend) == np.sign(d_actual_)).mean() * 100)
+    return mh_, ml_, hit, beta_eff
 
 
-def _eval_beta(beta):
-    return _eval_beta_adaptive(beta, 0.0)[:3]
+def _eval_on_val(beta_base, reduction):
+    return _apply_beta(beta_base, reduction, ens_m_va, ens_d_va, d_dir_va,
+                       trend_str_va, close_va, hi_true_va, lo_true_va,
+                       d_va.values)
 
 
+def _eval_on_test(beta_base, reduction):
+    return _apply_beta(beta_base, reduction, ens_m_te, ens_d_te, d_dir_te,
+                       trend_str_te, close_te, hi_true, lo_true,
+                       d_te.values)
+
+
+# Tune (β_base, r) on VAL only.
 beta_grid = np.linspace(0, 1, 11)
 red_grid  = [0.0, 0.3, 0.5, 0.7, 0.9]
-print(f"\n   (β_base, reduction) sweep — adaptive: β_eff = β_base × "
+print(f"\n   (β_base, reduction) sweep on VAL — adaptive: β_eff = β_base × "
       f"(1 − r × min(|ret_5|/{TREND_SAT}, 1))")
 print(f"   {'β':<6}{'r':<6}{'MAPE_H':<10}{'MAPE_L':<10}{'AVG':<10}{'DIR_HIT':<10}")
-best_beta, best_red, best_avg = 1.0, 0.0, float("inf")
+best_beta, best_red, best_avg_va = 1.0, 0.0, float("inf")
 results = []
 for b in beta_grid:
     for r in red_grid:
-        mh_b, ml_b, hit_b, _ = _eval_beta_adaptive(b, r)
+        mh_b, ml_b, hit_b, _ = _eval_on_val(b, r)
         avg = (mh_b + ml_b) / 2
         results.append((b, r, mh_b, ml_b, avg, hit_b))
-        if avg < best_avg:
-            best_avg, best_beta, best_red = avg, float(b), float(r)
+        if avg < best_avg_va:
+            best_avg_va, best_beta, best_red = avg, float(b), float(r)
 for b, r, mh_b, ml_b, avg, hit_b in results:
-    star = "  ←best" if (b == best_beta and r == best_red) else ""
+    star = "  ←best (val)" if (b == best_beta and r == best_red) else ""
     print(f"   {b:<6.2f}{r:<6.2f}{mh_b:<10.3f}{ml_b:<10.3f}{avg:<10.3f}{hit_b:<10.1f}{star}")
 
-mh_base, ml_base, hit_base = _eval_beta(1.0)
-mh_dir, ml_dir, hit_dir = _eval_beta(0.0)
-mh_best, ml_best, hit_best, beta_eff_te = _eval_beta_adaptive(best_beta, best_red)
-print(f"\n   No direction (β=1.00):    MAPE_H={mh_base:.3f}  MAPE_L={ml_base:.3f}  "
-      f"dir_hit={hit_base:.1f}%")
-print(f"   Pure direction (β=0):     MAPE_H={mh_dir:.3f}  MAPE_L={ml_dir:.3f}  "
-      f"dir_hit={hit_dir:.1f}%")
-print(f"   Adaptive (β_base={best_beta:.2f}, r={best_red:.2f}):  "
-      f"MAPE_H={mh_best:.3f}  MAPE_L={ml_best:.3f}  dir_hit={hit_best:.1f}%")
+# Reference points on VAL for context
+mh_base_va, ml_base_va, hit_base_va, _ = _eval_on_val(1.0, 0.0)
+mh_dir_va,  ml_dir_va,  hit_dir_va,  _ = _eval_on_val(0.0, 0.0)
+print(f"\n   VAL  No direction (β=1.00): MAPE_H={mh_base_va:.3f}  MAPE_L={ml_base_va:.3f}  dir_hit={hit_base_va:.1f}%")
+print(f"   VAL  Pure direction (β=0):  MAPE_H={mh_dir_va:.3f}  MAPE_L={ml_dir_va:.3f}  dir_hit={hit_dir_va:.1f}%")
+print(f"   VAL  Adaptive (β={best_beta:.2f}, r={best_red:.2f}): "
+      f"MAPE_H={results[next(i for i,(b,r,*_) in enumerate(results) if b==best_beta and r==best_red)][2]:.3f}  "
+      f"MAPE_L={results[next(i for i,(b,r,*_) in enumerate(results) if b==best_beta and r==best_red)][3]:.3f}")
 
-# Replace final_ph/final_pl with the direction-blended versions, so all
-# downstream metrics, residuals, and sigma reflect what will be served.
+# Final UNBIASED evaluation on TEST using tuned (α, β, r).
+mh_best, ml_best, hit_best, beta_eff_te = _eval_on_test(best_beta, best_red)
+mh_base, ml_base, hit_base, _ = _eval_on_test(1.0, 0.0)
+mh_dir,  ml_dir,  hit_dir,  _ = _eval_on_test(0.0, 0.0)
+print(f"\n   TEST No direction (β=1.00): MAPE_H={mh_base:.3f}  MAPE_L={ml_base:.3f}  dir_hit={hit_base:.1f}%")
+print(f"   TEST Pure direction (β=0):  MAPE_H={mh_dir:.3f}   MAPE_L={ml_dir:.3f}   dir_hit={hit_dir:.1f}%")
+print(f"   TEST Tuned (β={best_beta:.2f}, r={best_red:.2f}): "
+      f"MAPE_H={mh_best:.3f}  MAPE_L={ml_best:.3f}  dir_hit={hit_best:.1f}%  ← unbiased estimate")
+
+# Replace final_ph/final_pl with the direction-blended versions for test
+# reporting (residuals, σ, headline metrics).
 d_blend_te = beta_eff_te * ens_d_te + (1 - beta_eff_te) * d_dir_te
 final_ph = ens_m_te + d_blend_te
 final_pl = ens_m_te - d_blend_te
@@ -576,11 +639,17 @@ assets = dict(
         anchor_label="12:00 UTC (=7am CDT / 6am CST)",
         train_start=str(train.index.min().date()),
         train_end=str(train.index.max().date()),
+        val_start=str(val.index.min().date()),
+        val_end=str(val.index.max().date()),
         test_start=str(test.index.min().date()),
         test_end=str(test.index.max().date()),
-        train_n=int(len(train)), test_n=int(len(test)),
+        train_n=int(len(train)), val_n=int(len(val)), test_n=int(len(test)),
+        embargo_days=int(EMBARGO_DAYS),
         winner=final["model"],
         metrics=final,
+        tuning_notes=("α (climatology blend) and (β_base, r) (direction-head "
+                      "weight) were selected on VAL only; TEST is held out for "
+                      "unbiased reporting."),
     ),
 )
 joblib.dump(assets, src_path)

@@ -20,7 +20,8 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 from paths import (
-    HOURLY_MODEL, DAILY_MODEL_CT, BINANCE_HOURLY_CSV,
+    HOURLY_MODEL, DAILY_MODEL_CT, CONE_7D_MODEL, DAY_TYPE_MODEL,
+    BINANCE_HOURLY_CSV,
     BOOKMARKS_FILE as _BOOKMARKS_PATH, RUNTIME_DIR,
 )
 
@@ -65,15 +66,87 @@ sigma     = A["sigma"]
 feat_cols = A["feat_cols"]
 best_name = A.get("best_name","ridge")
 
+
+@st.cache_resource
+def _training_cutoffs():
+    """Return {model_label: train_end_date_or_None} for the 4 artefacts.
+
+    Used by the historical-replay banner to warn the user when their
+    picked date falls inside any model's training window — predictions
+    for those dates are in-sample fit, not honest out-of-sample forecasts.
+    """
+    out = {}
+    # Hourly: stored as ISO datetime on newer artefacts; fall back to test_start.
+    he = A.get("train_end") or A.get("test_start")
+    out["hourly close"] = pd.Timestamp(he).normalize() if he else None
+    # Daily H/L
+    if os.path.exists(str(DAILY_MODEL_CT)):
+        try:
+            meta = joblib.load(DAILY_MODEL_CT).get("calibration_meta", {})
+            out["daily H/L"] = pd.Timestamp(meta.get("train_end")) if meta.get("train_end") else None
+        except Exception:
+            out["daily H/L"] = None
+    # 7-day cone
+    if os.path.exists(str(CONE_7D_MODEL)):
+        try:
+            meta = joblib.load(CONE_7D_MODEL).get("calibration_meta", {})
+            out["7-day cone"] = pd.Timestamp(meta.get("train_end")) if meta.get("train_end") else None
+        except Exception:
+            out["7-day cone"] = None
+    # 3-class
+    if os.path.exists(str(DAY_TYPE_MODEL)):
+        try:
+            meta = joblib.load(DAY_TYPE_MODEL).get("calibration_meta", {})
+            out["3-class day type"] = pd.Timestamp(meta.get("train_end")) if meta.get("train_end") else None
+        except Exception:
+            out["3-class day type"] = None
+    return out
+
+
+def render_replay_in_sample_warning(target_date):
+    """If `target_date` falls inside any model's training window, show a
+    yellow warning explaining the predictions on this date are in-sample
+    fit (memorisation), not honest out-of-sample forecasts."""
+    if target_date is None:
+        return
+    td = pd.Timestamp(target_date).normalize()
+    affected = []
+    for name, end in _training_cutoffs().items():
+        if end is not None and td <= end:
+            affected.append(f"**{name}** (train ≤ {end.date()})")
+    if affected:
+        st.warning(
+            "⚠️  **In-sample replay.**  You picked **"
+            f"{td.date()}** — this date falls inside the training window of: "
+            + ", ".join(affected) + ". The predictions and "
+            "look-back metrics shown for in-sample dates are MEMORISATION, "
+            "not honest forecasts; they will look unrealistically accurate. "
+            "Pick a date AFTER each model's `train_end` to see genuine "
+            "out-of-sample behaviour."
+        )
+
 with st.sidebar:
     st.markdown(
         "**Auto-refresh:** every "
         f"{REFRESH_SECONDS // 60} min. Click **Refresh now** to force.")
     if st.button("Refresh now", use_container_width=True):
-        st.cache_data.clear(); st.rerun()
+        # Clear BOTH caches so retrained joblibs are picked up too — without
+        # this, `cache_resource`-decorated loaders (`load_assets`,
+        # `_load_cone_7d`, `_load_day_type`) hold onto the previous artefact
+        # for the lifetime of the session.
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
     st.markdown(
-        f"_Hourly BTC bars update every hour; macro and F&G update less often._"
+        "_Hourly BTC bars update every hour; macro and F&G update less often._"
     )
+    # Model freshness — train_end of each artefact, so users can tell at a
+    # glance which version of each model is live in the UI.
+    st.markdown("---")
+    st.caption("**Model freshness** (`train_end`)")
+    for label, end in _training_cutoffs().items():
+        end_str = f"`{end.date()}`" if end is not None else "_unknown_"
+        st.caption(f"&bull; {label}: {end_str}", unsafe_allow_html=True)
 
 # ───────────────────────── fetch helpers ──────────────────────────────
 def _flat(df, name):
@@ -107,13 +180,21 @@ def fetch_data():
         df = df.join(d)
     df = df.dropna(subset=["btc_close"])
 
-    # Fear & Greed daily, forward-filled to hourly
+    # Fear & Greed daily, forward-filled to hourly.
+    #
+    # IMPORTANT (causality): alternative.me's current-day F&G record is
+    # re-computed throughout the UTC day. Using the value stamped at
+    # 2026-05-21 00:00 UTC at hour 14:00 UTC would be look-ahead, because
+    # the value at fetch time reflects information from past 14:00 UTC.
+    # We lag by 1 day so hours of date D use D-1's finalised value (this
+    # mirrors src/train_hourly_model.py).
     try:
         r = requests.get("https://api.alternative.me/fng/?limit=0", timeout=20).json()
         fng = pd.DataFrame(r["data"])
         fng["dt"]    = pd.to_datetime(fng["timestamp"].astype(int), unit="s").dt.normalize()
         fng["value"] = fng["value"].astype(int)
         fng = fng[["dt","value"]].sort_values("dt").drop_duplicates("dt").set_index("dt")
+        fng = fng.shift(1, freq="D")   # ← 1-day causal lag (anti-leak)
         fng_h = fng.reindex(df.index.normalize()).ffill()
         df["fng"] = fng_h["value"].values
     except Exception:
@@ -558,6 +639,251 @@ def compute_daily_series(end_target_date_iso, days_back=7):
     return pd.DataFrame(rows)
 
 
+@st.cache_resource
+def _load_cone_7d():
+    """Load the 7-day close-price regime-cone artefact (or None if absent)."""
+    p = str(CONE_7D_MODEL)
+    if not os.path.exists(p):
+        return None
+    return joblib.load(p)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def compute_7d_close_cone_forecast(asof_date_iso):
+    """Forecast BTC close 7 days after `asof_date_iso` using the regime cone.
+
+    The cone is parameter-free at inference: classify the as-of bar's
+    ``range_ma30`` into one of three training-set terciles, take the
+    regime's median forward 7-day log-return, multiply against the
+    as-of close, and apply a fixed ±9.7 % band (the headline empirical
+    band-width from notebooks/btc_7d_close_research.ipynb).
+
+    Returns ``None`` if the cone artefact is missing or the daily data
+    can't reach back 49 days. Otherwise returns a dict with:
+
+      history     – DataFrame of 7 weekly close observations spaced 7
+                    days apart ending at the as-of bar
+      pred_date   – target Timestamp = as_of + 7 days
+      pred_close  – predicted USD close at pred_date
+      lower / upper – ±9.7 % band on pred_close
+      regime, regime_label – tercile index and short label
+      band_pct    – the fixed band width (0.097)
+      asof_close  – the as-of-bar close used as the anchor
+    """
+    cone = _load_cone_7d()
+    if cone is None:
+        return None
+    daily = _fetch_daily_raw().copy()
+    if daily.empty:
+        return None
+
+    asof = pd.Timestamp(asof_date_iso)
+    # Snap to the latest available bar at or before asof
+    bars_avail = daily.loc[daily.index <= asof]
+    if bars_avail.empty:
+        return None
+    asof_t = bars_avail.index[-1]
+
+    # range_ma30 needs 30 prior daily bars; weekly history needs 49 days back
+    c = bars_avail["btc_close"]; h = bars_avail["btc_high"]; l_ = bars_avail["btc_low"]
+    range_today = (h - l_) / c
+    range_ma30  = range_today.rolling(30).mean()
+    rm30 = range_ma30.loc[asof_t]
+    if not np.isfinite(rm30):
+        return None
+
+    edges = np.asarray(cone["regime_edges"], dtype=float)
+    regime = int(np.searchsorted(edges, float(rm30), side="right"))
+    regime = max(0, min(len(edges), regime))
+    regime_label = ["low vol","mid vol","high vol"][regime] if regime < 3 else f"r{regime}"
+
+    stats = cone["regime_stats"][regime]
+    # Median forward 7-day log-return for this regime
+    med_logret = float(stats[0.50] if 0.50 in stats else stats["0.5"])
+    asof_close = float(c.loc[asof_t])
+    pred_close = asof_close * float(np.exp(med_logret))
+    band_pct = float(cone.get("band_pct", 0.097))
+    lower = pred_close * (1 - band_pct)
+    upper = pred_close * (1 + band_pct)
+    pred_date = asof_t + pd.Timedelta(days=7)
+
+    # Helper: snap a target date to the latest bar at or before it.
+    def _snap(d):
+        if d in c.index and pd.notna(c.loc[d]):
+            return d
+        prior = c.loc[c.index <= d]
+        return prior.index[-1] if not prior.empty else None
+
+    # 7 weekly target dates ending at asof_t (oldest → newest).
+    hist_dates, hist_closes = [], []
+    for k in range(6, -1, -1):
+        snapped = _snap(asof_t - pd.Timedelta(days=7 * k))
+        if snapped is not None:
+            hist_dates.append(snapped); hist_closes.append(float(c.loc[snapped]))
+    history = pd.DataFrame({"close": hist_closes}, index=pd.DatetimeIndex(hist_dates))
+
+    # Historical predictions: for each target date d in `history.index`,
+    # find the prediction-anchor date 7 days before, classify its regime
+    # via range_ma30 at that anchor, and apply the regime median return.
+    # The "actual" at d is just history.close[d].
+    rows = []
+    for d in history.index:
+        a = _snap(d - pd.Timedelta(days=7))
+        if a is None or not np.isfinite(range_ma30.loc[a]):
+            continue
+        a_close = float(c.loc[a])
+        rm30_a  = float(range_ma30.loc[a])
+        r       = int(np.searchsorted(edges, rm30_a, side="right"))
+        r       = max(0, min(len(edges), r))
+        m       = float(cone["regime_stats"][r][0.50])
+        p_close = a_close * float(np.exp(m))
+        rows.append(dict(
+            anchor_date   = a,
+            target_date   = d,
+            anchor_close  = a_close,
+            pred_close    = p_close,
+            lower         = p_close * (1 - band_pct),
+            upper         = p_close * (1 + band_pct),
+            actual_close  = float(c.loc[d]),
+            regime        = r,
+        ))
+    hist_preds = pd.DataFrame(rows)
+
+    # In historical-replay mode the +7d target may already be in the past;
+    # surface the realized close if data is available for that bar so the
+    # caller can plot the actual alongside the forecast star.
+    actual_pred_close, actual_pred_date = None, None
+    last_avail = c.index[-1]
+    if pred_date <= last_avail:
+        snapped_pred = _snap(pred_date)
+        if snapped_pred is not None and pd.notna(c.loc[snapped_pred]):
+            actual_pred_close = float(c.loc[snapped_pred])
+            actual_pred_date  = snapped_pred
+
+    return dict(
+        history          = history,
+        hist_preds       = hist_preds,
+        pred_date        = pred_date,
+        pred_close       = pred_close,
+        lower            = lower,
+        upper            = upper,
+        regime           = regime,
+        regime_label     = regime_label,
+        band_pct         = band_pct,
+        asof_close       = asof_close,
+        asof_date        = asof_t,
+        regime_median_logret = med_logret,
+        actual_pred_close = actual_pred_close,
+        actual_pred_date  = actual_pred_date,
+    )
+
+
+@st.cache_resource
+def _load_day_type():
+    """Load the 3-class day-type GBM artefact (or None if missing)."""
+    p = str(DAY_TYPE_MODEL)
+    if not os.path.exists(p):
+        return None
+    return joblib.load(p)
+
+
+@st.cache_data(ttl=86400, show_spinner="Classifying day-type …")
+def compute_day_type_forecast(target_date_iso):
+    """Classify the next 12:00-UTC bar as BigUpper / BigLower / Quiet.
+
+    Uses the H/L model's predictions + the cone regime + a handful of
+    raw daily features. Returns:
+      predicted_class    – str
+      probability        – top-class probability (0-1)
+      proba_by_class     – {class: probability}
+      target_date        – ISO date of the bar being classified
+      as_of_date         – the latest completed bar used
+      band_realized      – the test-set selective-accuracy table from the
+                           artefact (for the caption)
+    Returns None if the artefact is missing or the model can't load.
+    """
+    art = _load_day_type()
+    if art is None:
+        return None
+    gbm   = art["model"]
+    FEATS = art["feature_columns"]
+    cone  = _load_cone_7d()
+
+    # Recompute the same features the training script used at the cutoff
+    df = _fetch_daily_raw().copy()
+    target_date = pd.Timestamp(target_date_iso)
+    asof_cutoff = target_date - pd.Timedelta(days=1)
+    df = df.loc[df.index <= asof_cutoff].sort_index().ffill(limit=5)
+    if df.empty:
+        return None
+    c = df["btc_close"]; h = df["btc_high"]; l_ = df["btc_low"]; v = df["btc_volume"]
+    f = pd.DataFrame(index=df.index)
+    ret = np.log(c).diff()
+    for k in [3, 7, 14]:           f[f"ret_{k}"] = ret.rolling(k).sum()
+    for k in [10, 20, 30]:         f[f"vol_{k}"] = ret.rolling(k).std()
+    prev_c = c.shift(1)
+    tr_ = pd.concat([(h - l_), (h - prev_c).abs(), (l_ - prev_c).abs()], axis=1).max(axis=1)
+    for k in [7, 14, 30]:          f[f"atr_{k}"] = tr_.rolling(k).mean() / c
+    f["range_today"] = (h - l_) / c
+    f["range_ma7"]   = ((h - l_) / c).rolling(7).mean()
+    f["range_ma30"]  = ((h - l_) / c).rolling(30).mean()
+    f["range_std30"] = ((h - l_) / c).rolling(30).std()
+    e12 = c.ewm(span=12, adjust=False).mean()
+    e26 = c.ewm(span=26, adjust=False).mean()
+    macd = e12 - e26
+    f["macd"]      = macd / c
+    f["macd_hist"] = (macd - macd.ewm(span=9, adjust=False).mean()) / c
+    ma20 = c.rolling(20).mean(); sd20 = c.rolling(20).std()
+    f["bb_width"]   = (4 * sd20) / ma20
+    delta = c.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    f["rsi_14"] = 100 - 100 / (1 + rs)
+    dow = df.index.dayofweek
+    for i in range(6):
+        f[f"dow_{i}"] = (dow == i).astype(float)
+
+    # Cone regime one-hots
+    edges = np.asarray(art.get("regime_edges") or cone["regime_edges"])
+    reg   = int(np.searchsorted(edges, float(f["range_ma30"].iloc[-1]), side="right").clip(0, 2))
+    for r in (0, 1, 2):
+        f[f"regime_{r}"] = float(r == reg)
+
+    # H/L model predictions and direction-head probability (use only the
+    # as-of row to keep this cheap)
+    fc = A["feat_cols"]
+    daily_forecast = compute_daily_forecast(target_date_iso)
+    if daily_forecast is None:
+        return None
+    close_asof = daily_forecast["close_asof"]
+    pred_high  = daily_forecast["pred_high"]
+    pred_low   = daily_forecast["pred_low"]
+    p_bull     = daily_forecast.get("p_bull", 0.5)
+    f["pred_y_hi"]  = (pred_high - close_asof) / close_asof
+    f["pred_y_lo"]  = (close_asof - pred_low)  / close_asof
+    f["pred_range"] = f["pred_y_hi"] + f["pred_y_lo"]
+    f["pred_skew"]  = f["pred_y_hi"] - f["pred_y_lo"]
+    f["p_bull"]     = float(p_bull)
+
+    asof_t = df.index[-1]
+    x_row = f.loc[[asof_t], FEATS]
+    if x_row.isna().any().any():
+        return None
+    proba = gbm.predict_proba(x_row)[0]
+    cls   = list(gbm.classes_)
+    proba_by_class = {c: float(p) for c, p in zip(cls, proba)}
+    top_idx = int(np.argmax(proba))
+    return dict(
+        predicted_class = cls[top_idx],
+        probability     = float(proba[top_idx]),
+        proba_by_class  = proba_by_class,
+        target_date     = target_date,
+        as_of_date      = asof_t,
+        calibration     = art.get("calibration_meta", {}),
+    )
+
+
 def build_features(df):
     f = pd.DataFrame(index=df.index)
     c, h, l_, v = df["btc_close"], df["btc_high"], df["btc_low"], df["btc_volume"]
@@ -651,6 +977,8 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None,
             target_date = pd.Timestamp((ref_t - timedelta(hours=ANCHOR_HOUR_UTC)).date())
         else:
             target_date = pd.Timestamp(picked_date_ct)
+        # Warn if the picked date is in any model's training window.
+        render_replay_in_sample_warning(target_date)
     daily = compute_daily_forecast(target_date.strftime("%Y-%m-%d"))
 
     # Rolling forecast target (now+1h in live, as_of+1h in historical)
@@ -740,6 +1068,69 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None,
                 f"{be_str}</small>",
                 unsafe_allow_html=True,
             )
+
+    # ────── 3-class day-type classifier (Big Upper / Big Lower / Quiet) ──
+    day_type = compute_day_type_forecast(target_date.strftime("%Y-%m-%d"))
+    if day_type is not None:
+        DT_COLORS  = {"BigUpper": "#16a34a", "BigLower": "#dc2626", "Quiet": "#475569"}
+        DT_EMOJI   = {"BigUpper": "🔼",      "BigLower": "🔽",      "Quiet": "▫️"}
+        DT_LABEL   = {"BigUpper": "Big Upper Movement",
+                      "BigLower": "Big Lower Movement",
+                      "Quiet":    "Quiet Movement"}
+        pc   = day_type["predicted_class"]
+        prob = day_type["probability"]
+        probs = day_type["proba_by_class"]
+        cal   = day_type["calibration"]
+        td    = pd.Timestamp(day_type["target_date"])
+        # Confidence-gated guidance — match the artefact's stored selective
+        # table to a coarse band so the caption stays honest.
+        if   prob >= 0.65: gating = "high confidence"
+        elif prob >= 0.55: gating = "moderate confidence"
+        elif prob >= 0.45: gating = "low confidence"
+        else:              gating = "very low confidence"
+        st.markdown(
+            f"#### {DT_EMOJI[pc]} Day-type forecast — "
+            f"<span style='color:{DT_COLORS[pc]}'>"
+            f"<b>{DT_LABEL[pc]}</b></span> "
+            f"<small>(confidence <b>{prob*100:.0f}%</b> · {gating})</small>",
+            unsafe_allow_html=True,
+        )
+        # Probability bar: three horizontal segments with widths ∝ probability
+        order = ["BigUpper", "BigLower", "Quiet"]
+        bar_html = "<div style='display:flex; width:100%; height:24px; border-radius:6px; overflow:hidden; border:1px solid #ddd; font-size:11px; font-weight:600; color:white;'>"
+        for k in order:
+            pct = probs.get(k, 0.0) * 100
+            border = ("3px solid #111" if k == pc else "0")
+            bar_html += (
+                f"<div title='{DT_LABEL[k]}: {pct:.1f}%' "
+                f"style='flex: {max(probs.get(k,0.001), 0.001)}; "
+                f"background:{DT_COLORS[k]}; "
+                f"display:flex; align-items:center; justify-content:center; "
+                f"border-right:{border};'>"
+                f"{DT_EMOJI[k]} {pct:.0f}%"
+                f"</div>"
+            )
+        bar_html += "</div>"
+        st.markdown(bar_html, unsafe_allow_html=True)
+        # Honest caption: test acc + selective accuracy at the relevant band
+        test_acc = cal.get("test_accuracy_pct")
+        test_n   = cal.get("test_n")
+        sel      = cal.get("selective", [])
+        # Pick the largest threshold the current prob satisfies
+        matched  = max((s for s in sel if prob >= s["thr"]),
+                       key=lambda s: s["thr"], default=None)
+        sel_note = ""
+        if matched is not None:
+            sel_note = (f" When the model is at least {matched['thr']:.0%} "
+                        f"confident it covers ~{matched['coverage_pct']:.0f}% of "
+                        f"days at {matched['accuracy_pct']:.0f}% accuracy on the held-out tail.")
+        st.caption(
+            f"3-class day-type classifier (GBM, 31 features). Predicts the "
+            f"realised next-day H/L bar shape for **{td.strftime('%Y-%m-%d')}**. "
+            f"Hold-out unconditional accuracy = {test_acc:.0f}% on n={test_n} days "
+            f"(majority baseline ≈ 33% on three balanced classes)."
+            + sel_note
+        )
 
     # ────── Historical picker (date strip, calendar, hour slider,
     # bookmarks) rendered RIGHT ABOVE the plots so the user can navigate
@@ -1102,6 +1493,33 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None,
             f"highlighted target = **{end_target.strftime('%Y-%m-%d')}**)"
         )
         fig2 = go.Figure()
+        # ±2 % uncertainty bands around each predicted line — added first so
+        # they render behind the prediction & actual markers.
+        DAILY_BAND_PCT = 0.02
+        # HIGH ±2% band (green tint)
+        fig2.add_trace(go.Scatter(
+            x=series["target_date"], y=series["pred_high"] * (1 + DAILY_BAND_PCT),
+            mode="lines", line=dict(color="rgba(34,139,34,0)"),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig2.add_trace(go.Scatter(
+            x=series["target_date"], y=series["pred_high"] * (1 - DAILY_BAND_PCT),
+            mode="lines", line=dict(color="rgba(34,139,34,0)"),
+            fill="tonexty", fillcolor="rgba(34,139,34,0.13)",
+            name=f"HIGH ±{DAILY_BAND_PCT*100:.0f}% band", hoverinfo="skip",
+        ))
+        # LOW ±2% band (red tint)
+        fig2.add_trace(go.Scatter(
+            x=series["target_date"], y=series["pred_low"] * (1 + DAILY_BAND_PCT),
+            mode="lines", line=dict(color="rgba(220,20,60,0)"),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig2.add_trace(go.Scatter(
+            x=series["target_date"], y=series["pred_low"] * (1 - DAILY_BAND_PCT),
+            mode="lines", line=dict(color="rgba(220,20,60,0)"),
+            fill="tonexty", fillcolor="rgba(220,20,60,0.13)",
+            name=f"LOW ±{DAILY_BAND_PCT*100:.0f}% band", hoverinfo="skip",
+        ))
         # Predicted HIGH line
         fig2.add_trace(go.Scatter(
             x=series["target_date"], y=series["pred_high"],
@@ -1255,6 +1673,214 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None,
         fig2.update_xaxes(tickformat="%a %d-%b")
         st.plotly_chart(fig2, use_container_width=True,
                         key=f"chart_daily_{'live' if is_live else 'hist'}")
+
+    # ─────────── 7-day close cone (regime-based) chart ────────────────────
+    # Past 7 weekly closes anchored at the daily-model target date, plus
+    # the +7d prediction and the fixed ±9.7 % band reported in
+    # notebooks/btc_7d_close_research.ipynb.
+    cone7 = compute_7d_close_cone_forecast(target_date.strftime("%Y-%m-%d"))
+    if cone7 is not None:
+        hist = cone7["history"]
+        ret_pct = (np.exp(cone7["regime_median_logret"]) - 1) * 100
+        st.markdown(
+            f"#### 📅 7-day close-price cone — regime: **{cone7['regime_label']}**  "
+            f"<small>(as-of {pd.Timestamp(cone7['asof_date']).strftime('%Y-%m-%d')} "
+            f"close ${cone7['asof_close']:,.0f} → "
+            f"forecast {cone7['pred_date'].strftime('%Y-%m-%d')} "
+            f"${cone7['pred_close']:,.0f} "
+            f"({ret_pct:+.2f}% regime median return), "
+            f"band ±{cone7['band_pct']*100:.1f}%)</small>",
+            unsafe_allow_html=True,
+        )
+        hp = cone7.get("hist_preds", pd.DataFrame()).copy()
+        band_pct = cone7["band_pct"]
+        # In historical replay, when the +7d target already has a realized
+        # close, treat it as the *last historical prediction* (with its
+        # actual on the realized line) rather than as a future-looking
+        # star. This keeps the chart strictly past-only in Historical
+        # Replay so every prediction has an actual to compare against.
+        in_hist_with_actual = (
+            (not is_live) and (cone7.get("actual_pred_close") is not None)
+        )
+        if in_hist_with_actual:
+            hp = pd.concat([
+                hp,
+                pd.DataFrame([{
+                    "anchor_date":  cone7["asof_date"],
+                    "target_date":  cone7["pred_date"],
+                    "anchor_close": cone7["asof_close"],
+                    "pred_close":   cone7["pred_close"],
+                    "lower":        cone7["lower"],
+                    "upper":        cone7["upper"],
+                    "actual_close": cone7["actual_pred_close"],
+                    "regime":       cone7["regime"],
+                }]),
+            ], ignore_index=True)
+            hist = pd.concat([
+                hist,
+                pd.DataFrame({"close": [cone7["actual_pred_close"]]},
+                             index=pd.DatetimeIndex([cone7["actual_pred_date"]])),
+            ])
+        fig3 = go.Figure()
+
+        # Historical ±band — shaded fill across consecutive prediction targets.
+        if len(hp) >= 2:
+            fig3.add_trace(go.Scatter(
+                x=list(hp["target_date"]), y=list(hp["upper"]),
+                mode="lines",
+                line=dict(color="rgba(37,99,235,0)"),
+                hoverinfo="skip", showlegend=False,
+            ))
+            fig3.add_trace(go.Scatter(
+                x=list(hp["target_date"]), y=list(hp["lower"]),
+                mode="lines",
+                line=dict(color="rgba(37,99,235,0)"),
+                fill="tonexty", fillcolor="rgba(147,197,253,0.25)",
+                name=f"hist ±{band_pct*100:.1f}% band",
+                hoverinfo="skip",
+            ))
+        # Historical prediction markers + per-point error bars (redundant with
+        # the fill but reads clearer for individual points)
+        if len(hp):
+            fig3.add_trace(go.Scatter(
+                x=list(hp["target_date"]), y=list(hp["pred_close"]),
+                mode="lines+markers", name="historical predictions",
+                line=dict(color="#2563eb", width=1.4, dash="dot"),
+                marker=dict(size=10, color="#2563eb", symbol="diamond",
+                            line=dict(color="white", width=1)),
+                error_y=dict(
+                    type="data",
+                    array=list(hp["upper"] - hp["pred_close"]),
+                    arrayminus=list(hp["pred_close"] - hp["lower"]),
+                    color="#93c5fd", thickness=1.2, width=4,
+                ),
+                hovertemplate=(
+                    "target %{x|%Y-%m-%d}<br>"
+                    "predicted $%{y:,.0f}<br>"
+                    f"band ±{band_pct*100:.1f}%"
+                    "<extra></extra>"
+                ),
+            ))
+        # Realized closes (actuals) at each historical target date
+        fig3.add_trace(go.Scatter(
+            x=list(hist.index), y=list(hist["close"]),
+            mode="lines+markers", name="realized close",
+            line=dict(color="#1f2937", width=2),
+            marker=dict(size=9, color="#1f2937"),
+            hovertemplate="actual %{x|%Y-%m-%d}<br>$%{y:,.0f}<extra></extra>",
+        ))
+        if is_live:
+            # Live mode: forward-looking +7d star (no actual exists yet).
+            fig3.add_trace(go.Scatter(
+                x=[hist.index[-1], cone7["pred_date"]],
+                y=[hist["close"].iloc[-1], cone7["pred_close"]],
+                mode="lines",
+                line=dict(color="#2563eb", width=2, dash="dot"),
+                hoverinfo="skip", showlegend=False,
+            ))
+            fig3.add_trace(go.Scatter(
+                x=[cone7["pred_date"]], y=[cone7["pred_close"]],
+                mode="markers+text", name="7-day forecast",
+                marker=dict(size=14, color="#2563eb", symbol="star",
+                            line=dict(color="white", width=1)),
+                text=[f"${cone7['pred_close']:,.0f}"],
+                textposition="top center",
+                error_y=dict(
+                    type="data",
+                    array=[cone7["upper"] - cone7["pred_close"]],
+                    arrayminus=[cone7["pred_close"] - cone7["lower"]],
+                    color="#60a5fa", thickness=2, width=6,
+                ),
+                hovertemplate=(
+                    "forecast %{x|%Y-%m-%d}<br>"
+                    f"median ${cone7['pred_close']:,.0f}<br>"
+                    f"band ±{band_pct*100:.1f}% "
+                    f"→ ${cone7['lower']:,.0f}…${cone7['upper']:,.0f}"
+                    "<extra></extra>"
+                ),
+            ))
+            fig3.add_shape(
+                type="rect",
+                x0=cone7["pred_date"] - pd.Timedelta(days=1),
+                x1=cone7["pred_date"] + pd.Timedelta(days=1),
+                y0=cone7["lower"], y1=cone7["upper"],
+                fillcolor="rgba(147,197,253,0.45)", line=dict(width=0),
+                layer="below",
+            )
+        elif in_hist_with_actual:
+            # Historical replay AND the last prediction has a realized
+            # actual: highlight that actual with a distinct X marker.
+            ap_close = cone7["actual_pred_close"]
+            ap_date  = cone7["actual_pred_date"]
+            ap_err   = (cone7["pred_close"] - ap_close) / ap_close * 100
+            ap_inside = (cone7["lower"] <= ap_close <= cone7["upper"])
+            fig3.add_trace(go.Scatter(
+                x=[ap_date], y=[ap_close],
+                mode="markers+text", name="actual at last prediction",
+                marker=dict(size=14, color="#dc2626", symbol="x-thin",
+                            line=dict(color="#dc2626", width=4)),
+                text=[f"${ap_close:,.0f}"],
+                textposition="bottom center",
+                hovertemplate=(
+                    "actual %{x|%Y-%m-%d}<br>"
+                    f"$%{{y:,.0f}}<br>"
+                    f"forecast error: {ap_err:+.2f}%<br>"
+                    f"{'inside' if ap_inside else 'outside'} "
+                    f"±{cone7['band_pct']*100:.1f}% band"
+                    "<extra></extra>"
+                ),
+            ))
+        # else: Historical replay where +7d is still unrealized — drop
+        # that point entirely (user requested past-only points).
+        fig3.update_layout(
+            height=380, template="plotly_white",
+            yaxis_title="BTC / USD",
+            xaxis_title="Date",
+            margin=dict(t=40, r=30, b=40, l=70),
+            legend=dict(orientation="h", x=0, xanchor="left", y=1.10,
+                        yanchor="bottom", bgcolor="rgba(255,255,255,0.95)",
+                        bordercolor="#ccc", borderwidth=1, font=dict(size=11)),
+        )
+        fig3.update_xaxes(tickformat="%d-%b")
+        st.plotly_chart(fig3, use_container_width=True,
+                        key=f"chart_7d_cone_{'live' if is_live else 'hist'}")
+        # Quick accuracy footnote on historical predictions
+        accuracy_note = ""
+        if len(hp):
+            err_pct = (hp["pred_close"] - hp["actual_close"]).abs() / hp["actual_close"] * 100
+            within_band = ((hp["actual_close"] >= hp["lower"])
+                           & (hp["actual_close"] <= hp["upper"])).mean() * 100
+            accuracy_note = (
+                f"  Historical (last {len(hp)} weekly targets): MAPE = "
+                f"{err_pct.mean():.2f} %; "
+                f"{within_band:.0f} % of actuals fell inside the ±{band_pct*100:.1f} % band."
+            )
+        if is_live:
+            legend_blurb = (
+                "Diamonds = historical predictions made 7 days *before* each target; "
+                "black dots = realized weekly closes; "
+                "star = current +7-day forecast with band."
+            )
+        elif in_hist_with_actual:
+            legend_blurb = (
+                "Diamonds = historical predictions made 7 days *before* each target; "
+                "black dots = realized weekly closes; "
+                "red ✕ at the last point = realized close at the most recent "
+                "7-day target (Historical Replay shows past predictions only)."
+            )
+        else:
+            legend_blurb = (
+                "Diamonds = historical predictions made 7 days *before* each target; "
+                "black dots = realized weekly closes. "
+                "(Historical Replay shows only past predictions whose target "
+                f"date has a realized close — the +7-day target "
+                f"{cone7['pred_date'].strftime('%Y-%m-%d')} is still in the future.)"
+            )
+        st.caption(
+            legend_blurb + " The fixed ±9.7 % interval corresponds to ≈ 88 % "
+            "empirical coverage on the held-out 8-month tail "
+            "(see `notebooks/btc_7d_close_research.ipynb`)." + accuracy_note
+        )
 
     # ─────────────────────── live look-back metrics ───────────────────────
     if lb_metrics:

@@ -18,9 +18,11 @@ RUNTIME_DIR    = ROOT / "runtime"
 TESTS_DIR      = ROOT / "tests"
 LEGACY_DIR     = ROOT / "legacy"
 
-# Active model artefacts (7am-CT daily + hourly close)
+# Active model artefacts (7am-CT daily + hourly close + 7-day cone + 3-class)
 DAILY_MODEL_CT  = MODELS_DIR / "inference_assets_ct.joblib"
 HOURLY_MODEL    = MODELS_DIR / "inference_assets_hourly.joblib"
+CONE_7D_MODEL   = MODELS_DIR / "inference_assets_7d_cone.joblib"
+DAY_TYPE_MODEL  = MODELS_DIR / "inference_assets_3class.joblib"
 
 # Data
 BINANCE_HOURLY_CSV  = DATA_DIR / "binance_hourly_btc.csv"

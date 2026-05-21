@@ -1,16 +1,27 @@
 # btc-range-model
 
-A two-model forecasting stack for Bitcoin, served through a Streamlit dashboard:
+A four-model Bitcoin forecasting stack served through a Streamlit dashboard:
 
 | Model | What it predicts | Cadence | Horizon |
 |---|---|---|---|
 | **Daily H/L (7am-CT)** | Next 24-hour bar's `high` and `low` | Refreshes once per day at 12:00 UTC (= 7am CDT / 6am CST) | 1 bar (24 h) ahead |
 | **Hourly close** | Next-hour BTC closing price | Refreshes every 60 s in the live tab | 1 hour ahead |
+| **7-day close cone** | Median + ±9.7 % band for the close 7 days out | Refreshes once per day | 7 days ahead |
+| **3-class day-type** | Next-day bar shape: `BigUpper` / `BigLower` / `Quiet` | Refreshes once per day | 1 bar ahead |
 
-Both models are linear-or-shallow learners trained on a mix of BTC price/volume
+All four are linear-or-shallow learners trained on a mix of BTC price/volume
 history, cross-market macro indicators, on-chain blockchain metrics, and a
 sentiment index. The Streamlit UI surfaces their predictions side-by-side with
 realised price action so accuracy is observable in real time.
+
+> **Anti-leakage methodology** (May 2026 retrain). Every model uses a strict
+> chronological **train / val / test** split with a per-horizon embargo gap; α,
+> β, model winner, and σ are all selected on **val** with **test untouched**
+> until final reporting. The Fear & Greed feed — which alternative.me updates
+> intraday on the current day's record — is lagged 1 day for the hourly model.
+> The 3-class day-type model uses **TimeSeriesSplit-5 out-of-fold H/L
+> predictions** for rows ≤ the H/L training cutoff to remove stacked in-sample
+> contamination. See [§Leakage audit & fixes](#leakage-audit--fixes).
 
 ---
 
@@ -74,11 +85,13 @@ pip install -r requirements.txt
 # Launch the dashboard
 streamlit run app/btc_hourly_app.py
 
-# Re-train the daily H/L model end-to-end (writes models/inference_assets_ct.joblib)
-python src/pipeline_ct.py
-
-# Re-train the hourly close model
-python src/train_hourly_model.py
+# Re-train the four models.
+# Order matters: pipeline_ct → cone → 3-class (the latter two read the H/L
+# artefact). Hourly is independent.
+python src/pipeline_ct.py            # daily H/L  → models/inference_assets_ct.joblib
+python src/train_7d_close_cone.py    # 7-day cone → models/inference_assets_7d_cone.joblib
+python src/train_3class_day_type.py  # day-type   → models/inference_assets_3class.joblib
+python src/train_hourly_model.py     # hourly     → models/inference_assets_hourly.joblib
 
 # Pull a fresh full BTC hourly history (writes data/binance_hourly_btc.csv)
 python src/fetch_binance_hourly.py
@@ -124,15 +137,32 @@ Target (per bar D):
   Reconstruct: pred_high = close·(1 + y_hi),  pred_low = close·(1 - y_lo)
 
 Model:
-  Ensemble of 3 regressors trained on MAE/Huber losses:
-    1. HuberRegressor       (linear, robust)
-    2. BayesianRidge        (linear, regularized)
-    3. GradientBoostingRegressor(loss="absolute_error", 1500 trees, depth 3, lr 0.01)
-  Mean of all three predictions, then shrinkage-blended with the training-set
-  climatological mean offset (μ_hi, μ_lo).  The blend coefficient α is chosen
-  on the test set; α = 1.00 in the current artefact (= no climatology blend).
+  Ensemble of 3 regressors (all wrapped in StandardScaler):
+    1. HuberRegressor                (linear, robust)
+    2. QuantileRegressor   (q=0.70, linear quantile)
+    3. GradientBoostingRegressor     (loss="quantile", q=0.70,
+                                      1500 trees, depth 3, lr 0.01)
+  Pure mean of the three predictions, then a shrinkage blend with the
+  training-set climatological mean offset (μ_hi, μ_lo) using α.
 
-Hold-out:  last 8 months of the data (243 days) → never seen during training.
+Direction head:
+  GradientBoostingClassifier on sign(y_hi − y_lo). The post-α ensemble is
+  reparameterised into (half-range m, asymmetry d); d is blended with a
+  classifier-driven d using an adaptive β_eff = β_base × (1 − r × trend_str),
+  where trend_str = min(|ret_5|/0.05, 1).
+
+Tuning protocol (anti-leak):
+  TRAIN  → fit ensemble + direction classifier
+  VAL    → pick α and (β_base, r) by validation MAPE
+  TEST   → final, untouched evaluation (never seen during tuning)
+  Embargo of 1 day between train↔val and val↔test (= forecast horizon)
+  so a training row's shift(-1) target cannot live in the next split.
+
+Current split (artefact dated 2026-05-21):
+  TRAIN  2019-04-01 → 2025-09-17   (n=2342)
+  VAL    2025-09-18 → 2025-11-17   (n=61)
+  TEST   2025-11-18 → 2026-05-18   (n=182)
+  Selected: α = 1.00, β_base = 1.00, r = 0.30.
 ```
 
 ### Features — full inventory (103 total)
@@ -214,54 +244,60 @@ For each series `S` the three features are:
 | `_d7` | `log(S[t]) − log(S[t-7])` | Week-over-week trend |
 | `_z30` | z-score of `log(S)` over 30 days | Standardised deviation from monthly norm |
 
-#### Target lags (4 features)
+#### Smoothed past-target features (4 features) + anti-mean-reversion (6 features) + downside regime (4 features)
 
-| Feature | Definition |
-|---|---|
-| `y_hi_lag1` | yesterday's realised `y_hi = (next_high − close) / close` |
-| `y_lo_lag1` | yesterday's realised `y_lo = (close − next_low) / close` |
-| `y_hi_lag7_ma` | 7-day moving average of `y_hi_lag1` |
-| `y_lo_lag7_ma` | 7-day moving average of `y_lo_lag1` |
+| Family | Feature | Definition |
+|---|---|---|
+| Smoothed lag | `y_hi_ema3`, `y_hi_ema7`, `y_lo_ema3`, `y_lo_ema7` | EMA (span 3, 7) of `y_hi.shift(1)` / `y_lo.shift(1)`. Smoother than a raw lag → less mean-reversion overshoot. |
+| Breakout signals | `above_3d_high`, `below_3d_low`, `bo_strength_up`, `bo_strength_dn` | Binary + magnitude versions of `close vs max/min(high, 3) / min/max(low, 3)`. |
+| "Surprise" | `y_hi_surprise`, `y_lo_surprise` | `y_hi.shift(1) − ema7(y_hi.shift(1))` — how much yesterday's excursion differed from the recent baseline. |
+| Downside | `dn_vol_5`, `dn_vol_20`, `below_sma50`, `below_sma50_5d` | Downside-only realised vol (5/20-day) + flags for "close below SMA50" (today, and ≥5 of last 5 days). |
 
-These give the model a memory of how its own target has been behaving — range is autocorrelated, so yesterday's realised range is informative about today's.
+These give the model a memory of how its own target has been behaving — range
+is autocorrelated, so yesterday's realised range is informative — without the
+single-day lag's tendency to over-anchor and oscillate.
 
-#### Top contributors (permutation importance, from training run)
+#### Top contributors
 
-From `legacy/`'s saved permutation-importance scan (UTC-anchored data, but the feature set is identical to the current 7am-CT model so the ranking is informative):
+Permutation importance for the current daily H/L artefact is not persisted in
+the joblib; the per-feature ranking from prior training runs (price-action
+dominant: `range_today`, `atr_7`, `dist_hi_30`, day-of-week effects, and
+`oc_transaction_fees_usd_z30` as the strongest on-chain contributor) is
+qualitatively unchanged with the new train/val/test methodology. The dominance
+of price-action and self-lag families confirms range is mostly autoregressive;
+macro and on-chain provide secondary refinement.
 
-1. `dow_4` (Friday) — strong day-of-week effect
-2. `range_today` — auto-correlation with today's range
-3. `y_lo_lag7_ma` — recent-week LOW behavior
-4. `atr_7` — short-window volatility
-5. `dist_hi_30` — proximity to 30-day high
-6. `y_lo_lag1` — yesterday's LOW deviation
-7. `dow_2` (Wednesday) — mid-week pattern
-8. `oc_transaction_fees_usd_z30` — fee-market anomalies
-9. `range_ma7` — week's average range
-10. `bb_width` — Bollinger width compression
+### Held-out test metrics  (honest — α/β tuned on **val**, test untouched)
 
-The dominance of price-action and self-lag features confirms range is mostly autoregressive; macro and on-chain provide secondary refinement.
-
-### Held-out test metrics
-
-Test window: **2025-09-18 → 2026-05-18** (243 days). Training: 2,342 days from 2019-04-01.
+Test window: **2025-11-18 → 2026-05-18** (182 days; 6 months). Validation
+window: 2025-09-18 → 2025-11-17 (61 days). Training: 2,342 days from
+2019-04-01.
 
 | Metric | HIGH | LOW |
 |---|---:|---:|
-| **MAPE** | **1.12 %** | **1.31 %** |
-| MAE (USD) | $973 | $1,101 |
-| RMSE (USD) | $1,241 | $1,970 |
-| Hit ±0.5 % | 25.1 % | 30.5 % |
-| Hit ±1 % | 53.9 % | 59.7 % |
-| Hit ±2 % | 87.2 % | 84.4 % |
-| Hit ±5 % | 99.6 % | 95.9 % |
-| 95% CI half-width | ±2.93 % | ±3.97 % |
+| **MAPE** | **1.32 %** | **1.30 %** |
+| MAE (USD) | $1,049 | $988 |
+| RMSE (USD) | $1,291 | $1,475 |
+| Hit ±0.5 % | 20.9 % | 23.6 % |
+| Hit ±1 % | 45.1 % | 52.2 % |
+| Hit ±2 % | 79.7 % | 87.9 % |
+| Hit ±5 % | 100.0 % | 97.3 % |
+| σ (residual, return space) | 0.0161 | 0.0186 |
+| 95 % CI half-width | ±3.16 % | ±3.64 % |
+| Direction hit-rate (sign of y_hi − y_lo) | colspan=2 | **50.0 %** |
+| Direction classifier accuracy (TEST) | colspan=2 | 53.3 % |
 
-Reading those: the **typical error is ~1% of the close**, the model is
-within ±5% on ~99% of test days (i.e., it virtually never blows up), and on a
-strict ±1% accuracy bar it's right on ~55% of days. Compared with the
-training-set climatology baseline (MAPE 1.42% / 1.59%), the model extracts
-about 20% of the predictable structure above pure mean-reversion.
+> **Honest framing.** The previously-reported figures of MAPE 1.12 % / 1.31 %
+> and **53.8 %** direction hit-rate were inflated by hyperparameter tuning on
+> the test set. With α and β picked on a held-out val slice, MAPE_H lands at
+> **~1.32 %** and the direction-head's apparent edge **collapses to coin-flip
+> on test (50.0 %)**, even though the underlying classifier still gets 53.3 %
+> on test alone. The model's real value is **price-magnitude bracketing**, not
+> direction calling — use it as a volatility cone, not a directional signal.
+>
+> Compared with the training-set climatology baseline (val MAPE 1.37 % / 1.78 %),
+> the ensemble still extracts ~5–15 % of structure above pure mean-reversion
+> on val; α=1.00 means the artefact uses no climatology shrinkage.
 
 ### Inference contract (used by `app/`)
 
@@ -291,17 +327,32 @@ against the **live Binance spot** (refreshed every 30 s) to produce the
 Yahoo BTC-USD 1h bars  ─┐
 + ETH-USD, SPX, NDX,   │
   VIX, GOLD, DXY, TNX  ─┤ all resampled to a common hourly grid
-+ alternative.me F&G   ─┘ forward-filled across crypto weekends/off-hours
++ alternative.me F&G   ─┘ shifted 1 day, then forward-filled
 
 Target:  y = log(close[t+1] / close[t])     (i.e. one-hour log-return)
 
 Models compared:
-  • Ridge regression   ← winner
-  • GradientBoosting (squared loss & MAE)
-  • RandomForest
-Picked by lowest MAE on held-out test window.
+  • RidgeCV (linear, regularisation chosen by CV)
+  • GradientBoostingRegressor (squared loss, 800 trees, depth 3, lr 0.02)
 
-Hold-out: last 60 days of hourly data (rolling).
+Tuning protocol (anti-leak):
+  TRAIN  → fit each candidate model
+  VAL    → pick the winner by validation direction-accuracy; fit σ on VAL residuals
+  TEST   → final, untouched evaluation
+  Embargo of 1 hour between train↔val and val↔test (= forecast horizon).
+
+Current split (artefact dated 2026-05-21):
+  TRAIN  2024-05-28 22h UTC → 2026-03-21 02h UTC   (n=6487)
+  VAL    2026-03-22 22h UTC → 2026-04-05 23h UTC   (n=139)
+  TEST   2026-04-06 00h UTC → 2026-05-21 21h UTC   (n=339)
+  Winner: gbm.
+
+F&G causality fix:
+  alternative.me publishes one record per UTC date but re-computes the
+  current-day record *throughout* that day. Using the value stamped at
+  D 00:00 UTC at hour D 14:00 UTC leaks information from later than 14:00.
+  The series is therefore lagged by 1 day before joining (hours of D use
+  D-1's finalised value). Applied identically in the live `fetch_data()`.
 ```
 
 ### Features — full inventory (59 total)
@@ -372,53 +423,68 @@ Source: `alternative.me/fng` (daily; forward-filled to every hour within the day
 
 (`us_open` counts as the 5th when including the `weekend` flag, totaling 6 calendar features — see `feat_cols` for the exact set; the model uses 5 distinct calendar features after redundancy was pruned.)
 
-#### Top contributors (permutation importance, from training run)
+#### Top contributors (permutation importance on TEST, n_repeats=5)
 
-The hourly model's training run saved per-feature importance scores. Top 15:
+From the current artefact (gbm, 2026-05-21 retrain):
 
-| Rank | Feature | Importance score |
+| Rank | Feature | Importance |
 |---:|---|---:|
-| 1 | `vol_4h` | +0.00636 |
-| 2 | `vix_ret_24h` | +0.00546 |
-| 3 | `range_now` | +0.00482 |
-| 4 | `hr_cos` | +0.00306 |
-| 5 | `ret_1h` | +0.00205 |
-| 6 | `gold_ret_24h` | +0.00181 |
-| 7 | `eth_ret_24h` | +0.00180 |
-| 8 | `rsi_14` | +0.00177 |
-| 9 | `vix_ret_1h` | +0.00169 |
-| 10 | `tnx_vol_24h` | +0.00161 |
-| 11 | `ret_12h` | +0.00159 |
-| 12 | `gold_vol_24h` | +0.00158 |
-| 13 | `ret_2h` | +0.00141 |
-| 14 | `us_open` | +0.00104 |
-| 15 | `ret_24h` | +0.00104 |
+| 1 | `tnx_ret_1h` | +0.0221 |
+| 2 | `vix_ret_24h` | +0.0089 |
+| 3 | `ret_4h` | +0.0064 |
+| 4 | `vix_ret_1h` | +0.0056 |
+| 5 | `btc_eth_corr_24` | +0.0052 |
+| 6 | `eth_vol_24h` | +0.0044 |
+| 7 | `spx_ret_1h` | +0.0040 |
+| 8 | `vol_48h` | +0.0037 |
+| 9 | `tnx_ret_24h` | +0.0036 |
+| 10 | `dxy_ret_24h` | +0.0030 |
+| 11 | `ndx_vol_24h` | +0.0027 |
+| 12 | `eth_ret_24h` | +0.0026 |
+| 13 | `vol_z_24` | +0.0024 |
+| 14 | `vol_4h` | +0.0022 |
+| 15 | `dxy_ret_1h` | +0.0016 |
 
-**Reading:** the top driver is **short-window realized volatility** (`vol_4h`). The model is essentially trading on "given the last 4 hours' volatility regime + the current bar's range + the most recent VIX move + the time of day, what's the next hour's expected return?" — a classic GARCH-style + cross-asset volatility-routing model. Notably, **VIX returns and the cyclic hour-of-day feature outrank most BTC-only price features** — confirming the model uses macro-vol context, not just BTC autoregression.
+**Reading:** the top driver is **the 1-hour change in the 10-year Treasury
+yield** (`tnx_ret_1h`), followed by the **VIX 24-hour return** — i.e., short-
+horizon rates and risk-off pressure dominate. Cross-asset features (TNX, VIX,
+SPX, ETH, DXY, GOLD) take 10 of the top 15 slots; BTC-internal features
+(`ret_4h`, `vol_48h`, `vol_z_24`, `vol_4h`) take the rest. The hourly model
+is best read as a **macro-vol regime classifier** routed through Bitcoin
+returns, not a BTC-autoregressive model.
 
-### Held-out test metrics
+### Held-out metrics  (val picks the winner, test is unbiased)
 
-Test window: **2026-03-20 → 2026-05-19** (≈ 1,460 hours of hourly data).
-Winning model: **Ridge regression on log-returns**.
+Test window: **2026-04-06 → 2026-05-21** (≈ 1,080 hours of hourly data).
+Validation window: 2026-03-22 → 2026-04-05 (≈ 340 hours).
+Winning model: **GradientBoostingRegressor on log-returns** (picked by
+VAL direction-accuracy; ridge was second).
 
-| Metric | Value |
-|---|---:|
-| MAPE on next-hour close | **0.32 %** |
-| MAE (USD) | $235 |
-| RMSE (USD) | $336 |
-| Hit ±0.5 % | 79.8 % |
-| Hit ±1 % | 95.1 % |
-| Hit ±3 % | 100 % |
-| **Direction accuracy** | **53.8 %** |
-| σ (residual, log-return space) | 0.00463 |
-| 95 % CI half-width on predicted close | ±0.91 % |
+| Metric | VAL (used for selection) | TEST (unbiased) |
+|---|---:|---:|
+| MAPE on next-hour close | 0.40 % | **0.29 %** |
+| MAE (USD) | $271 | **$220** |
+| RMSE (USD) | $381 | $317 |
+| Hit ±0.5 % | 73.4 % | 83.8 % |
+| Hit ±1 % | 91.4 % | 96.2 % |
+| Hit ±3 % | 100.0 % | 100.0 % |
+| **Direction accuracy** | 51.1 % | **50.15 %** |
+| R² on log-return | −0.05 | +0.007 |
+| σ (residual, log-return space) | 0.0056 | — |
+| 95 % CI half-width on predicted close (from VAL σ) | colspan=2 | **±1.09 %** |
 
-**Honest framing:** hitting ±3 % at a 1-hour horizon is trivial because hourly
-BTC moves rarely exceed 3 %. The real signal of value in this model is
-**direction accuracy at ~54 %** (modestly above coin-flip after costs would
-need accuracy > ~52 %) and the **tight 0.91 % 95 % CI** that brackets the
-expected return tightly. Use it as a directional gate plus volatility-cone
-forecaster, not as a price-target oracle.
+> **Honest framing.** The previously-reported **53.8 % direction accuracy was
+> a test-selection artifact** — when we pick the winning model on TEST, the
+> winner's TEST score is by construction optimistic. Picking on VAL instead
+> gives a TEST direction accuracy of **50.15 %**, indistinguishable from a
+> coin-flip. ±3 % "accuracy" is also trivially ~100 % at a 1-hour horizon
+> since hourly BTC moves rarely exceed 3 %.
+>
+> What the hourly model *can* honestly offer is a **tight 1-hour volatility
+> cone** — the 95 % CI half-width of ±1.09 % brackets the expected return
+> reasonably well — and a **slight magnitude advantage** (0.29 % MAPE
+> vs ~0.39 % for the zero-return baseline). Use it as a vol-cone forecaster,
+> *not* as a directional signal.
 
 ### Inference contract (used by `app/`)
 
@@ -428,6 +494,163 @@ forecaster, not as a price-target oracle.
   forecast point. Display ±0.5 % band around it.
 - A 24-hour walk-forward look-back is recomputed every refresh so accuracy
   metrics on the last realised hours are visible.
+
+---
+
+## Model 3 — 7-day close cone
+
+### What it predicts
+
+The expected close 7 days after the as-of bar, with a fixed-width
+uncertainty band that reflects empirical regime-conditioned dispersion of
+7-day forward returns.
+
+### Pipeline (`src/train_7d_close_cone.py`)
+
+```
+features_ct.csv (12:00-UTC daily features matrix)
++ raw_ct.csv    (BTC close)
+
+Target:  y_logret_7 = log(close[t+7] / close[t])
+
+Regime classifier:
+  Bin training-set days into terciles of range_ma30 (30-day avg of (h-l)/c).
+  Three regimes: low / mid / high realised-vol.
+
+For each regime r:
+  Record empirical quantiles {10, 25, 50, 75, 90} of y_logret_7 on TRAIN.
+
+Forecast at time t:
+  regime(t) = tercile of range_ma30(t)
+  pred_close = close(t) * exp(regime_stats[regime(t)][0.50])
+  band       = pred_close × (1 ± 0.097)        # fixed ±9.7 %
+
+Embargo: 7 days (= forecast horizon) between train_end and test_start so
+the last train rows' shift(-7) target does not contain any test-window
+prices.
+```
+
+### Current artefact (2026-05-21 retrain)
+
+| Field | Value |
+|---|---|
+| Train | 2019-04-01 → 2025-09-14   (n=2339) |
+| Test  | 2025-09-21 → 2026-05-12   (n=234) |
+| Embargo | 7 days |
+| Tercile edges (range_ma30) | 0.0379 / 0.0506 |
+| Held-out coverage of ±9.7 % band | **88.0 %** |
+| Band width (fixed) | ±9.7 % around regime median |
+
+Regime medians (forward 7-day log-return) on TRAIN:
+
+| Regime | Label | Median log-ret | Median % equiv | n_train |
+|---:|---|---:|---:|---:|
+| 0 | low vol  | +0.0105 | +1.06 % | 780 |
+| 1 | mid vol  | −0.0025 | −0.25 % | 779 |
+| 2 | high vol | +0.0130 | +1.31 % | 780 |
+
+(The 90th-percentile up-move is meaningfully different across regimes:
++10.7 % in low-vol, +9.0 % in mid-vol, +15.1 % in high-vol regimes — so the
+band's *coverage* changes by regime even though its *width* is fixed.)
+
+### Inference contract (used by `app/`)
+
+`compute_7d_close_cone_forecast(asof_date_iso)` in `app/btc_hourly_app.py`:
+- classifies the as-of bar's `range_ma30` into a regime,
+- multiplies the as-of close by `exp(regime_stats[regime][0.50])`,
+- applies a fixed ±9.7 % band on the resulting price,
+- also returns the last 7 weekly close observations and their 7-day-back
+  predictions so the historical-replay tab can plot realised closes vs the
+  prior week's cone forecasts.
+
+---
+
+## Model 4 — 3-class day-type classifier
+
+### What it predicts
+
+Categorical label for the next 12:00-UTC bar's shape:
+
+| Class | Definition |
+|---|---|
+| `BigUpper` | (y_hi + y_lo) ≥ TRAIN tercile threshold **and** y_hi > y_lo |
+| `BigLower` | (y_hi + y_lo) ≥ TRAIN tercile threshold **and** y_lo > y_hi |
+| `Quiet`    | (y_hi + y_lo) < TRAIN tercile threshold |
+
+### Pipeline (`src/train_3class_day_type.py`)
+
+```
+Features = the 103 daily features in features_ct.csv
+         + 5 model-derived features:
+              pred_y_hi, pred_y_lo, pred_range, pred_skew, p_bull
+         + 3 cone-regime one-hots (regime_0 / regime_1 / regime_2)
+         → 31 total
+
+Classifier: GradientBoostingClassifier (400 trees, depth 3, lr 0.03).
+
+Anti-leak: TimeSeriesSplit-5 OOF for the H/L-derived features
+  • Rows ≤ H/L train_end were IN-SAMPLE to the saved H/L ensemble +
+    direction classifier; if we used those directly as features, the
+    3-class model would learn to over-trust pred_y_hi / pred_y_lo / p_bull
+    because they match y_hi / y_lo / sign too closely on train.
+  • Instead, TimeSeriesSplit(5) refits the full H/L ensemble + direction
+    classifier on each fold's growing training window, then predicts on
+    the val fold. That gives **honest out-of-fold** H/L predictions for
+    every in-H/L-train row. Rows after H/L train_end keep the saved-model
+    preds (which are already legitimately out-of-sample to H/L).
+  • The first ~1/(N_splits+1) of the data has no val-fold assignment in
+    TimeSeriesSplit and is dropped from 3-class training.
+  • A 1-day embargo separates 3-class TRAIN from TEST.
+
+Quiet threshold: 34th percentile of (y_hi + y_lo) on TRAIN only.
+```
+
+### Current artefact (2026-05-21 retrain)
+
+| Field | Value |
+|---|---|
+| Train | 2020-05-06 → 2026-02-17   (n=2,103, after dropping the 392 un-OOF'd prefix rows) |
+| Test  | 2026-02-19 → 2026-05-18   (n=89) |
+| Embargo | 1 day |
+| OOF strategy | TimeSeriesSplit(5), embargo 1 day per fold |
+| H/L train_end (boundary for OOF vs direct) | 2025-09-17 |
+| Quiet threshold (y_hi + y_lo) on TRAIN | 0.0289 |
+| TRAIN class balance | Quiet 715 / BigUpper 705 / BigLower 683 |
+| TEST class balance | Quiet 35 / BigUpper 29 / BigLower 25 |
+
+### Held-out test metrics
+
+| Metric | Value |
+|---|---:|
+| **Unconditional accuracy** | **52.8 %** (vs 33 % majority baseline) |
+| Balanced accuracy | 49.6 % |
+| F1 — Quiet | 0.697 |
+| F1 — BigUpper | 0.318 |
+| F1 — BigLower | 0.400 |
+
+Selective accuracy by top-class probability:
+
+| p ≥ | Coverage | Accuracy | n |
+|---:|---:|---:|---:|
+| 0.45 | 74.2 % | 56.1 % | 66 |
+| 0.50 | 57.3 % | 58.8 % | 51 |
+| **0.55** | **43.8 %** | **69.2 %** | **39** |
+| 0.60 | 23.6 % | 76.2 % | 21 |
+| 0.65 | 15.7 % | 64.3 % | 14 |
+
+> **Reading.** The 3-class model is *not* useful when forced to label every
+> day (52.8 % overall) — but it earns most of its accuracy on the days where
+> it's confident. At `p ≥ 0.55` it covers ~44 % of days at ~69 % accuracy;
+> at `p ≥ 0.60` it covers ~24 % of days at ~76 %. The Quiet class is by far
+> the easiest to call; both Big-move classes have weak recall.
+
+### Inference contract (used by `app/`)
+
+`compute_day_type_forecast(target_date_iso)` in `app/btc_hourly_app.py`:
+- pulls the same 31 features at the as-of bar (using the H/L model's
+  predictions and the cone's regime one-hots),
+- runs the GBM classifier,
+- returns the top class plus full probability vector for the pill display.
 
 ---
 
@@ -570,21 +793,66 @@ feed gap, not a bug.
 
 ## Limitations & known caveats
 
-1. **Yahoo hourly history is capped at ~2 years.** The historical-replay
+1. **Direction edge is coin-flip out-of-sample.** With α, β, and the model
+   winner all picked on a VAL slice instead of TEST, both the daily H/L
+   model's and the hourly model's directional accuracy lands at ~50 % on
+   TEST. The earlier 53–54 % figures were a test-tuning artefact. **Use
+   these models for magnitude/volatility bracketing, not direction calling.**
+2. **The 3-class model is most useful in selective mode.** Its 52.8 %
+   unconditional accuracy is barely above the 33 % majority baseline, but
+   restricting to days where `p_top ≥ 0.55` yields ~69 % accuracy at ~44 %
+   coverage. Treat the pill colour as advisory; trust the probability bar.
+3. **Yahoo hourly history is capped at ~2 years.** The historical-replay
    tab's earliest selectable date floats forward as time passes.
-2. **Hourly model's macro features are daily-resolution.** Treasury yields,
+4. **Hourly model's macro features are daily-resolution.** Treasury yields,
    VIX, etc. are constant within a UTC day — they add directional signal
    over a week but no *intraday* signal.
-3. **The 7am-CT boundary uses a fixed 12:00 UTC anchor**, not a DST-following
+5. **The 7am-CT boundary uses a fixed 12:00 UTC anchor**, not a DST-following
    "always 7 AM Central" rule. The chart label always says "7 am CT", but
    in the November–March window the actual local time the bar starts is
    6 AM CST. This was a deliberate trade — uniform 24-h bars beat one 23/25 h
    bar per year.
-4. **`live_spot` is BTC/USDT, not BTC/USD.** The ~5 bp basis is rarely
+6. **`live_spot` is BTC/USDT, not BTC/USD.** The ~5 bp basis is rarely
    material but worth knowing.
-5. **The 95 % CI on the daily LOW prediction is wider than the HIGH** (σ_lo
-   0.0203 vs σ_hi 0.0150). BTC drawdowns are heavier-tailed than rallies in
-   this training window.
+7. **σ_lo > σ_hi on daily H/L** (0.0186 vs 0.0161 in the current artefact).
+   BTC drawdowns are heavier-tailed than rallies in this training window,
+   so the LOW prediction has a slightly wider 95 % CI half-width (±3.64 %)
+   than the HIGH (±3.16 %).
+8. **In-sample replay banner.** When a user picks a historical date inside
+   any model's training window, the app shows a yellow `st.warning`
+   explaining the predictions for that date are memorisation, not honest
+   forecasts. Pick a date after each model's `train_end` (see each model's
+   section) to see genuine out-of-sample behaviour.
+
+---
+
+## Leakage audit & fixes
+
+Following a leakage audit in May 2026, the training and inference code paths
+were hardened against five classes of issue. Snapshot of the fixes:
+
+| Issue | Where | Fix |
+|---|---|---|
+| Hyperparameters (α, β, model winner, σ) tuned on TEST | `src/pipeline_ct.py`, `src/train_hourly_model.py` | New TRAIN / VAL / TEST split. Tuning lives on VAL; TEST untouched until final report. |
+| No embargo at train/test boundary (target shifted forward) | All 4 training scripts | Embargo of `horizon` rows between splits: 1 day (daily H/L, 3-class), 1 hour (hourly), 7 days (cone). |
+| Stacked in-sample H/L predictions used as features for 3-class | `src/train_3class_day_type.py` | TimeSeriesSplit-5 with 1-day per-fold embargo generates OOF H/L predictions for rows ≤ H/L train_end; rows after use direct preds. |
+| Historical-replay tab silently shows in-sample fit for dates inside train windows | `app/btc_hourly_app.py` | Yellow `st.warning` banner naming each affected model and its `train_end` whenever the picked date is in-sample. |
+| Fear & Greed index is updated *intraday* on its current-day record (alternative.me) — using it at hour h on date D leaks information from later than h | `src/train_hourly_model.py` + `app/btc_hourly_app.py` (`fetch_data`) | F&G series is shifted forward by 1 day before joining, so hours of date D always use date D-1's finalised value. (Daily H/L is unaffected: its bar D ends at D+1 12:00 UTC, by which time D's F&G is finalised.) |
+
+What changed in the headline metrics after these fixes (daily H/L and hourly):
+
+| Metric | Old (test-tuned, no embargo) | New (val-tuned, embargoed) |
+|---|---:|---:|
+| Daily H/L MAPE_H | 1.12 % | **1.32 %** |
+| Daily H/L MAPE_L | 1.31 % | **1.30 %** |
+| Daily H/L direction hit-rate | 53.8 % | **50.0 %** |
+| Hourly MAPE | 0.32 % | **0.29 %** |
+| Hourly direction accuracy | 53.8 % | **50.15 %** |
+| Hourly 95 % CI half-width | ±0.91 % | **±1.09 %** |
+
+The MAPE numbers moved by ≤ 0.2 percentage points (the magnitude estimates
+were honest); the direction-accuracy numbers collapsed by ~3.8 pp because
+they were almost entirely test-tuning inflation.
 
 ---
 
@@ -595,12 +863,15 @@ plus two ancillary models (7-day window max/min; per-horizon k=1..7) that the
 current dashboard does not use. See [`legacy/README.md`](legacy/README.md)
 for details and why they were superseded.
 
-Backtest summary (UTC-midnight vs 7am-CT, on similar 8-month hold-outs):
+Backtest summary (UTC-midnight legacy vs 7am-CT current):
 
-| Model | MAPE H | MAPE L |
-|---|---:|---:|
-| UTC-midnight (legacy) | 1.09 % | 1.28 % |
-| **7am-CT (current)** | **1.12 %** | **1.31 %** |
+| Model | Methodology | MAPE H | MAPE L |
+|---|---|---:|---:|
+| UTC-midnight (legacy)         | test-tuned α, no embargo | 1.09 % | 1.28 % |
+| 7am-CT (previous test-tuned)  | test-tuned α/β, no embargo | 1.12 % | 1.31 % |
+| **7am-CT (current honest)**   | **val-tuned α/β, 1-day embargo** | **1.32 %** | **1.30 %** |
 
-Statistically indistinguishable. The CT pipeline was adopted for boundary
-semantics, not predictive lift.
+The current artefact's MAPE_H is ~0.2 pp higher because the previous figure
+was an in-grid best on TEST; honestly-tuned, the model performs roughly the
+same as legacy. The CT boundary remains preferred for semantics (uniform
+24-h bars, no DST 23/25-h edge case), not for predictive lift.
