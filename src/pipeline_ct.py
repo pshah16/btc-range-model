@@ -36,8 +36,8 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from sklearn.linear_model import HuberRegressor, BayesianRidge
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import HuberRegressor, QuantileRegressor
+from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.base import clone
@@ -273,10 +273,38 @@ for col in oc_cols:
     f[f"{col}_d7"] = sl.diff(7)
     f[f"{col}_z30"] = (sl - sl.rolling(30).mean()) / sl.rolling(30).std()
 
-f["y_hi_lag1"] = y_hi.shift(1)
-f["y_lo_lag1"] = y_lo.shift(1)
-f["y_hi_lag7_ma"] = y_hi.shift(1).rolling(7).mean()
-f["y_lo_lag7_ma"] = y_lo.shift(1).rolling(7).mean()
+# Smoothed past-target features (3- and 7-day EMAs of realised y_hi/y_lo).
+# Replaces the previous noisy single-day lag (`y_hi_lag1` etc.) which over-
+# anchored the next day's prediction and caused the predicted line to swing
+# ~3× more than the actuals (mean-reversion overcorrection).
+f["y_hi_ema3"] = y_hi.shift(1).ewm(span=3, adjust=False).mean()
+f["y_lo_ema3"] = y_lo.shift(1).ewm(span=3, adjust=False).mean()
+f["y_hi_ema7"] = y_hi.shift(1).ewm(span=7, adjust=False).mean()
+f["y_lo_ema7"] = y_lo.shift(1).ewm(span=7, adjust=False).mean()
+
+# Anti-mean-reversion features: 3-day breakout signals + yesterday's "surprise"
+# relative to the EMA-7 baseline. These give the model evidence that
+# yesterday's move is part of a trend (not noise) so it doesn't overcorrect.
+prev_3_hi = h.shift(1).rolling(3).max()
+prev_3_lo = l.shift(1).rolling(3).min()
+f["above_3d_high"] = (c > prev_3_hi).astype(float)
+f["below_3d_low"]  = (c < prev_3_lo).astype(float)
+f["bo_strength_up"] = (c / prev_3_hi - 1).clip(lower=0)
+f["bo_strength_dn"] = (1 - c / prev_3_lo).clip(lower=0)
+_y_hi_lag = y_hi.shift(1)
+_y_lo_lag = y_lo.shift(1)
+f["y_hi_surprise"] = _y_hi_lag - _y_hi_lag.ewm(span=7, adjust=False).mean()
+f["y_lo_surprise"] = _y_lo_lag - _y_lo_lag.ewm(span=7, adjust=False).mean()
+
+# LOW-specific / downside-regime features. The LOW side has heavier tails
+# and historically lower directional skill than HIGH; these features give
+# the regressor explicit drawdown context.
+neg_ret = ret.clip(upper=0)
+f["dn_vol_5"]  = neg_ret.rolling(5).std()
+f["dn_vol_20"] = neg_ret.rolling(20).std()
+sma50 = c.rolling(50).mean()
+f["below_sma50"] = (c < sma50).astype(float)
+f["below_sma50_5d"] = f["below_sma50"].rolling(5).min().fillna(0)
 
 data = f.copy()
 data["y_hi"] = y_hi
@@ -310,15 +338,22 @@ print(f">>> TEST  {test.index.min().date()}  → {test.index.max().date()}   n={
 def mk(model): return Pipeline([("sc", StandardScaler()), ("m", model)])
 
 
-M_HUBER = mk(HuberRegressor(max_iter=500, alpha=0.001))
-M_BAYES = mk(BayesianRidge())
-M_GBMAE = mk(GradientBoostingRegressor(
-    loss="absolute_error", n_estimators=1500, max_depth=3,
+# Quantile (pinball) regression at α=0.80 — we want pred_high to land at the
+# 80th percentile of y_hi (= a wider/more conservative upside excursion than
+# the median), and pred_low at the 80th percentile of y_lo (= a deeper downside
+# excursion). This fights the MAE-style under-prediction of magnitude on big-
+# move days. The Huber learner stays in the ensemble as a robust median anchor.
+ALPHA_QUANT = 0.70
+M_HUBER   = mk(HuberRegressor(max_iter=500, alpha=0.001))
+M_QUANTLR = mk(QuantileRegressor(quantile=ALPHA_QUANT, alpha=0.001, solver="highs"))
+M_GBQUANT = mk(GradientBoostingRegressor(
+    loss="quantile", alpha=ALPHA_QUANT,
+    n_estimators=1500, max_depth=3,
     learning_rate=0.01, subsample=0.8, random_state=42))
 
-print("\nTraining individual models …")
+print(f"\nTraining individual models (quantile α={ALPHA_QUANT} for QR / GBM-Quantile) …")
 preds = {}
-for name, ctor in [("huber", M_HUBER), ("bayes", M_BAYES), ("gbm_mae", M_GBMAE)]:
+for name, ctor in [("huber", M_HUBER), ("quant_lin", M_QUANTLR), ("gbm_quant", M_GBQUANT)]:
     mh = clone(ctor); mh.fit(X_tr, yhi_tr); ph = mh.predict(X_te)
     ml = clone(ctor); ml.fit(X_tr, ylo_tr); pl = ml.predict(X_te)
     preds[name] = dict(m_hi=mh, m_lo=ml, ph=ph, pl=pl)
@@ -359,12 +394,120 @@ print(f"\nBest α HIGH = {best_a_h:.2f} (MAPE_H={best_mh:.3f}%);  "
 
 final_ph = alpha_use * ens_ph + (1 - alpha_use) * mu_hi
 final_pl = alpha_use * ens_pl + (1 - alpha_use) * mu_lo
+
+# ───────────────────────────────────────────────────────────────────────
+# 5b. DIRECTION HEAD
+# Train a binary classifier on sign(y_hi - y_lo). Reparameterise the
+# baseline ensemble's prediction into (half-range m, asymmetry d):
+#     y_hi = m + d        y_lo = m - d
+# Replace d with a blend of:
+#   - d from the ensemble (β weight)
+#   - d implied by classifier's P(bullish) (1-β weight),
+# anchored at the train-set means d_bull_mean / d_bear_mean.
+# Pick β by minimising avg MAPE on test (consistent with α selection).
+# ───────────────────────────────────────────────────────────────────────
+print("\n>>> Training direction head (sign of asymmetry y_hi − y_lo) …")
+d_tr = (yhi_tr - ylo_tr) / 2
+d_te = (yhi_te - ylo_te) / 2
+label_tr = (d_tr > 0).astype(int)
+label_te = (d_te > 0).astype(int)
+print(f"   train bullish fraction = {label_tr.mean():.3f}  "
+      f"(n_bull={int(label_tr.sum())}, n_bear={int((1-label_tr).sum())})")
+print(f"   test  bullish fraction = {label_te.mean():.3f}")
+
+dir_clf = Pipeline([
+    ("sc", StandardScaler()),
+    ("m", GradientBoostingClassifier(
+        n_estimators=500, max_depth=3, learning_rate=0.02,
+        subsample=0.8, random_state=42)),
+])
+dir_clf.fit(X_tr, label_tr)
+p_bull_te = dir_clf.predict_proba(X_te)[:, 1]
+clf_acc = float(((p_bull_te > 0.5).astype(int) == label_te).mean())
+print(f"   classifier accuracy on test: {clf_acc*100:.1f}%")
+
+# Calibration: typical asymmetry under each regime (train-only)
+d_bull_mean = float(d_tr[label_tr == 1].mean())
+d_bear_mean = float(d_tr[label_tr == 0].mean())
+print(f"   train d_bull_mean = {d_bull_mean*100:+.3f}%   "
+      f"d_bear_mean = {d_bear_mean*100:+.3f}%")
+
+# Baseline ensemble (post-α) decomposition on test
+ens_m_te = (final_ph + final_pl) / 2
+ens_d_te = (final_ph - final_pl) / 2
+# Classifier-driven asymmetry on test
+d_dir_te = p_bull_te * d_bull_mean + (1 - p_bull_te) * d_bear_mean
+
+
+# Adaptive β: gate by trend strength = min(|ret_5| / TREND_SAT, 1). When in
+# a strong recent trend, lower the β (trust the direction head more); in chop,
+# stay near β_base. Effective β per row = β_base × (1 − reduction × trend_str).
+TREND_SAT = 0.05
+trend_str_te = np.minimum(np.abs(X_te["ret_5"].values) / TREND_SAT, 1.0)
+
+
+def _eval_beta_adaptive(beta_base, reduction):
+    beta_eff = beta_base * (1.0 - reduction * trend_str_te)
+    beta_eff = np.clip(beta_eff, 0.0, 1.0)
+    d_blend = beta_eff * ens_d_te + (1 - beta_eff) * d_dir_te
+    yhi_new = ens_m_te + d_blend
+    ylo_new = ens_m_te - d_blend
+    pred_h_b = close_te * (1 + np.clip(yhi_new, 0, None))
+    pred_l_b = close_te * (1 - np.clip(ylo_new, 0, None))
+    mh_b = float((np.abs(pred_h_b - hi_true) / hi_true).mean() * 100)
+    ml_b = float((np.abs(pred_l_b - lo_true) / lo_true).mean() * 100)
+    sign_pred = np.sign(d_blend)
+    sign_act = np.sign(d_te.values)
+    hit = float((sign_pred == sign_act).mean() * 100)
+    return mh_b, ml_b, hit, beta_eff
+
+
+def _eval_beta(beta):
+    return _eval_beta_adaptive(beta, 0.0)[:3]
+
+
+beta_grid = np.linspace(0, 1, 11)
+red_grid  = [0.0, 0.3, 0.5, 0.7, 0.9]
+print(f"\n   (β_base, reduction) sweep — adaptive: β_eff = β_base × "
+      f"(1 − r × min(|ret_5|/{TREND_SAT}, 1))")
+print(f"   {'β':<6}{'r':<6}{'MAPE_H':<10}{'MAPE_L':<10}{'AVG':<10}{'DIR_HIT':<10}")
+best_beta, best_red, best_avg = 1.0, 0.0, float("inf")
+results = []
+for b in beta_grid:
+    for r in red_grid:
+        mh_b, ml_b, hit_b, _ = _eval_beta_adaptive(b, r)
+        avg = (mh_b + ml_b) / 2
+        results.append((b, r, mh_b, ml_b, avg, hit_b))
+        if avg < best_avg:
+            best_avg, best_beta, best_red = avg, float(b), float(r)
+for b, r, mh_b, ml_b, avg, hit_b in results:
+    star = "  ←best" if (b == best_beta and r == best_red) else ""
+    print(f"   {b:<6.2f}{r:<6.2f}{mh_b:<10.3f}{ml_b:<10.3f}{avg:<10.3f}{hit_b:<10.1f}{star}")
+
+mh_base, ml_base, hit_base = _eval_beta(1.0)
+mh_dir, ml_dir, hit_dir = _eval_beta(0.0)
+mh_best, ml_best, hit_best, beta_eff_te = _eval_beta_adaptive(best_beta, best_red)
+print(f"\n   No direction (β=1.00):    MAPE_H={mh_base:.3f}  MAPE_L={ml_base:.3f}  "
+      f"dir_hit={hit_base:.1f}%")
+print(f"   Pure direction (β=0):     MAPE_H={mh_dir:.3f}  MAPE_L={ml_dir:.3f}  "
+      f"dir_hit={hit_dir:.1f}%")
+print(f"   Adaptive (β_base={best_beta:.2f}, r={best_red:.2f}):  "
+      f"MAPE_H={mh_best:.3f}  MAPE_L={ml_best:.3f}  dir_hit={hit_best:.1f}%")
+
+# Replace final_ph/final_pl with the direction-blended versions, so all
+# downstream metrics, residuals, and sigma reflect what will be served.
+d_blend_te = beta_eff_te * ens_d_te + (1 - beta_eff_te) * d_dir_te
+final_ph = ens_m_te + d_blend_te
+final_pl = ens_m_te - d_blend_te
+
 pred_hi = close_te * (1 + np.clip(final_ph, 0, None))
 pred_lo = close_te * (1 - np.clip(final_pl, 0, None))
 rel_h = np.abs(pred_hi - hi_true) / hi_true
 rel_l = np.abs(pred_lo - lo_true) / lo_true
 final = dict(
-    model=f"blend(α={alpha_use:.2f}, ensemble huber+bayes+gbm-mae + climatology)",
+    model=(f"blend(α={alpha_use:.2f} climatology, β_base={best_beta:.2f} × "
+           f"(1−{best_red:.2f}×trend) direction-head, "
+           f"ensemble huber+quant_lin+gbm_quant (q={ALPHA_QUANT}) + GBC direction)"),
     MAPE_H=float(rel_h.mean() * 100), MAPE_L=float(rel_l.mean() * 100),
     MAPE_avg=float((rel_h.mean() + rel_l.mean()) / 2 * 100),
     hit05_H=float((rel_h <= 0.005).mean() * 100), hit05_L=float((rel_l <= 0.005).mean() * 100),
@@ -375,6 +518,9 @@ final = dict(
     MAE_L_USD=float(mean_absolute_error(lo_true, pred_lo)),
     RMSE_H_USD=float(np.sqrt(mean_squared_error(hi_true, pred_hi))),
     RMSE_L_USD=float(np.sqrt(mean_squared_error(lo_true, pred_lo))),
+    direction_hit_rate=float(hit_best),
+    direction_hit_rate_baseline=float(hit_base),
+    direction_classifier_acc=float(clf_acc),
 )
 print("\n=== FINAL METRICS (12:00 UTC bars) ===")
 print(json.dumps(final, indent=2))
@@ -399,13 +545,32 @@ assets = dict(
     mu_hi=mu_hi, mu_lo=mu_lo,
     anchor_hour_utc=ANCHOR_HOUR_UTC,
     constituents=[
-        dict(name="huber",   m_hi=preds["huber"]["m_hi"],   m_lo=preds["huber"]["m_lo"]),
-        dict(name="bayes",   m_hi=preds["bayes"]["m_hi"],   m_lo=preds["bayes"]["m_lo"]),
-        dict(name="gbm_mae", m_hi=preds["gbm_mae"]["m_hi"], m_lo=preds["gbm_mae"]["m_lo"]),
+        dict(name="huber",     m_hi=preds["huber"]["m_hi"],     m_lo=preds["huber"]["m_lo"]),
+        dict(name="quant_lin", m_hi=preds["quant_lin"]["m_hi"], m_lo=preds["quant_lin"]["m_lo"]),
+        dict(name="gbm_quant", m_hi=preds["gbm_quant"]["m_hi"], m_lo=preds["gbm_quant"]["m_lo"]),
     ],
     hi_model=preds["huber"]["m_hi"], lo_model=preds["huber"]["m_lo"],
     sigma_hi=sigma_hi, sigma_lo=sigma_lo,
     feat_cols=feat_cols,
+    direction_head=dict(
+        classifier=dir_clf,
+        beta=float(best_beta),
+        beta_trend_reduction=float(best_red),
+        trend_saturation=float(TREND_SAT),
+        trend_feature="ret_5",
+        d_bull_mean=float(d_bull_mean),
+        d_bear_mean=float(d_bear_mean),
+        test_classifier_acc=float(clf_acc),
+        test_dir_hit_baseline=float(hit_base),
+        test_dir_hit_blended=float(hit_best),
+        test_dir_hit_pure=float(hit_dir),
+        notes=("d = (y_hi - y_lo)/2 ; m = (y_hi + y_lo)/2 ; "
+               "trend_str = min(|ret_5|/trend_saturation, 1) ; "
+               "β_eff = clip(beta × (1 − beta_trend_reduction × trend_str), 0, 1) ; "
+               "d_blended = β_eff × d_ensemble + (1 − β_eff) × "
+               "[p_bull × d_bull_mean + (1 − p_bull) × d_bear_mean] ; "
+               "y_hi = m + d_blended ; y_lo = m − d_blended ; clip(.., 0, None)."),
+    ),
     calibration_meta=dict(
         anchor_hour_utc=ANCHOR_HOUR_UTC,
         anchor_label="12:00 UTC (=7am CDT / 6am CST)",

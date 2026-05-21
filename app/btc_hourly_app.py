@@ -325,17 +325,15 @@ def _fetch_daily_raw():
 
 
 @st.cache_data(ttl=86400, show_spinner="Computing daily H/L forecast …")
-def compute_daily_forecast(asof_date_iso):
-    """Apply the 12:00-UTC (7am-CT) daily model as it was trained:
+def compute_daily_forecast(target_date_iso):
+    """Apply the 12:00-UTC (7am-CT) daily model as it was trained.
 
-      - bar D covers [D 12:00 UTC, D+1 12:00 UTC)
-      - features = computed on full daily bars per `pipeline_ct.py`
-      - prediction = next bar's high/low, i.e. [D+1 12:00, D+2 12:00) UTC
-        = today 7am CT → tomorrow 7am CT
-
-    `asof_date_iso` = ISO date of the as-of bar's start D. The cache key is
-    exactly this date, so the prediction recomputes once per 12:00-UTC
-    rollover automatically."""
+    `target_date_iso` = ISO date of the bar BEING PREDICTED. That bar covers
+    [target 12:00 UTC, target+1 12:00 UTC) = [target 7am CT, target+1 7am CT).
+    Only data completed before the target bar starts is used — i.e. bars with
+    start date ≤ target − 1 day (the latest such bar closes at target 7am CT,
+    which is the target bar's open). The cache key is the target date, so the
+    prediction recomputes once per 12:00-UTC rollover automatically."""
     path = str(DAILY_MODEL_CT)
     if not os.path.exists(path):
         return None
@@ -346,9 +344,11 @@ def compute_daily_forecast(asof_date_iso):
 
     df = _fetch_daily_raw().copy()
 
-    # Truncate to bar-start dates ≤ asof_date so we only see completed bars
-    asof_date = pd.Timestamp(asof_date_iso)
-    df = df.loc[df.index <= asof_date]
+    # Truncate to bars that close at or before the target bar's open
+    # (target 12:00 UTC = target 7am CT). Those are bars with start ≤ target−1.
+    target_date = pd.Timestamp(target_date_iso)
+    asof_cutoff = target_date - pd.Timedelta(days=1)
+    df = df.loc[df.index <= asof_cutoff]
     if df.empty:
         return None
     df = df.sort_index().ffill(limit=5)
@@ -404,23 +404,40 @@ def compute_daily_forecast(asof_date_iso):
         f[f"{col}_z30"] = (s_log - s_log.rolling(30).mean())/s_log.rolling(30).std()
     nh, nl = h.shift(-1), l_.shift(-1)
     y_hi = (nh-c)/c; y_lo = (c-nl)/c
-    f["y_hi_lag1"]    = y_hi.shift(1)
-    f["y_lo_lag1"]    = y_lo.shift(1)
-    f["y_hi_lag7_ma"] = y_hi.shift(1).rolling(7).mean()
-    f["y_lo_lag7_ma"] = y_lo.shift(1).rolling(7).mean()
+    # Smoothed lag features (must match `src/pipeline_ct.py` exactly).
+    f["y_hi_ema3"] = y_hi.shift(1).ewm(span=3, adjust=False).mean()
+    f["y_lo_ema3"] = y_lo.shift(1).ewm(span=3, adjust=False).mean()
+    f["y_hi_ema7"] = y_hi.shift(1).ewm(span=7, adjust=False).mean()
+    f["y_lo_ema7"] = y_lo.shift(1).ewm(span=7, adjust=False).mean()
+    # Anti-mean-reversion features
+    prev_3_hi = h.shift(1).rolling(3).max()
+    prev_3_lo = l_.shift(1).rolling(3).min()
+    f["above_3d_high"] = (c > prev_3_hi).astype(float)
+    f["below_3d_low"]  = (c < prev_3_lo).astype(float)
+    f["bo_strength_up"] = (c / prev_3_hi - 1).clip(lower=0)
+    f["bo_strength_dn"] = (1 - c / prev_3_lo).clip(lower=0)
+    _y_hi_lag = y_hi.shift(1)
+    _y_lo_lag = y_lo.shift(1)
+    f["y_hi_surprise"] = _y_hi_lag - _y_hi_lag.ewm(span=7, adjust=False).mean()
+    f["y_lo_surprise"] = _y_lo_lag - _y_lo_lag.ewm(span=7, adjust=False).mean()
+    # LOW-specific / downside regime features
+    neg_ret = ret.clip(upper=0)
+    f["dn_vol_5"]  = neg_ret.rolling(5).std()
+    f["dn_vol_20"] = neg_ret.rolling(20).std()
+    sma50 = c.rolling(50).mean()
+    f["below_sma50"] = (c < sma50).astype(float)
+    f["below_sma50_5d"] = f["below_sma50"].rolling(5).min().fillna(0)
 
     f = f.replace([np.inf,-np.inf], np.nan)
     F = f[fc].dropna()
     if F.empty:
         return None
-    # df was already truncated to ≤ asof_date, so the last row is exactly
-    # the as-of bar (or the latest completed one if asof_date is on a
-    # weekend/holiday for the macro joins).
+    # df was already truncated to bars with start ≤ target − 1 day, so the
+    # last row is the as-of bar — the one whose close coincides with the
+    # target bar's open (target 12:00 UTC = target 7am CT).
     asof = F.index[-1]
     close_asof = float(c.loc[asof])
-    # asof is bar D's start date. Bar D ends (and target bar starts) at
-    # D+1 at 12:00 UTC; target bar ends at D+2 at 12:00 UTC.
-    target_date = asof + pd.Timedelta(days=1)
+    # The target bar covers [target 12:00 UTC, target+1 12:00 UTC).
     target_window_start = target_date + pd.Timedelta(hours=ANCHOR_HOUR_UTC)
     target_window_end   = target_date + pd.Timedelta(days=1, hours=ANCHOR_HOUR_UTC)
 
@@ -449,6 +466,43 @@ def compute_daily_forecast(asof_date_iso):
     else:
         yhi = _scalar(mh.predict(row)[0])
         ylo = _scalar(ml.predict(row)[0])
+
+    # Direction head (optional, present in newer artefacts). Reparameterise
+    # into (half-range m, asymmetry d), replace d with a blend of ensemble's
+    # d and a classifier-driven d, then reconstruct yhi/ylo.
+    # β is adaptive: trend_str = min(|ret_5|/trend_sat, 1); β_eff =
+    # β_base × (1 − reduction × trend_str). On trending days β shrinks
+    # (favour direction head); in chop β stays near β_base.
+    dh = AD.get("direction_head")
+    p_bull = None
+    beta_eff = None
+    if dh is not None and dh.get("classifier") is not None:
+        try:
+            clf = dh["classifier"]
+            beta_base    = float(dh.get("beta", 1.0))
+            reduction    = float(dh.get("beta_trend_reduction", 0.0))
+            trend_sat    = float(dh.get("trend_saturation", 0.05))
+            trend_feat   = dh.get("trend_feature", "ret_5")
+            d_bull_mean  = float(dh.get("d_bull_mean", 0.0))
+            d_bear_mean  = float(dh.get("d_bear_mean", 0.0))
+            p_bull = float(clf.predict_proba(row)[0, 1])
+            try:
+                ret_val = float(row.iloc[0][trend_feat])
+                trend_str = min(abs(ret_val) / trend_sat, 1.0)
+            except Exception:
+                trend_str = 0.0
+            beta_eff = max(0.0, min(1.0, beta_base * (1.0 - reduction * trend_str)))
+            m_pred = (yhi + ylo) / 2.0
+            d_pred = (yhi - ylo) / 2.0
+            d_dir  = p_bull * d_bull_mean + (1.0 - p_bull) * d_bear_mean
+            d_blend = beta_eff * d_pred + (1.0 - beta_eff) * d_dir
+            yhi = m_pred + d_blend
+            ylo = m_pred - d_blend
+        except Exception:
+            # If the classifier fails, fall back to ensemble-only prediction
+            p_bull = None
+            beta_eff = None
+
     sh  = _scalar(sh); sl = _scalar(sl)
     clip0 = lambda x: float(max(float(x), 0.0))
     pred_high = close_asof * (1 + clip0(yhi))
@@ -465,14 +519,16 @@ def compute_daily_forecast(asof_date_iso):
         target_window_end=target_window_end,
         pred_high=pred_high, high_ci_lo=band_hi_dn, high_ci_hi=band_hi_up,
         pred_low =pred_low,  low_ci_lo =band_lo_dn, low_ci_hi =band_lo_up,
+        p_bull=p_bull, beta_eff=beta_eff,
     )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def compute_daily_series(end_target_date_iso, days_back=7):
     """Build a series of (pred_high, pred_low, actual_high, actual_low) for the
-    last `days_back`+1 target days ending at `end_target_date`.  Each prediction
-    is generated by `compute_daily_forecast` with as_of = target_date - 1 day.
+    last `days_back`+1 target days ending at `end_target_date`. Each prediction
+    is generated by `compute_daily_forecast(target_date)`, which internally
+    uses data through target − 1 day (i.e. through target 7am CT).
 
     The cache TTL is 1 hour so the series refreshes when underlying data does."""
     end_target = pd.Timestamp(end_target_date_iso)
@@ -480,8 +536,7 @@ def compute_daily_series(end_target_date_iso, days_back=7):
     rows = []
     for i in range(days_back, -1, -1):
         target_date = end_target - pd.Timedelta(days=i)
-        as_of       = target_date - pd.Timedelta(days=1)
-        pred = compute_daily_forecast(as_of.strftime("%Y-%m-%d"))
+        pred = compute_daily_forecast(target_date.strftime("%Y-%m-%d"))
         if pred is None:
             continue
         ts = pd.Timestamp(target_date)
@@ -493,7 +548,8 @@ def compute_daily_series(end_target_date_iso, days_back=7):
                     else np.nan)
         rows.append(dict(
             target_date=ts,
-            as_of_date=pd.Timestamp(as_of),
+            as_of_date=pred["as_of_date"],
+            close_asof=float(pred["close_asof"]),
             pred_high=float(pred["pred_high"]),
             pred_low =float(pred["pred_low"]),
             actual_high=actual_h,
@@ -569,7 +625,8 @@ live_spot, live_spot_ts = fetch_live_spot()
 # ════════════════════════════════════════════════════════════════════════
 # Dashboard renderer — used by both Live and Historical tabs
 # ════════════════════════════════════════════════════════════════════════
-def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
+def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None,
+                     hist_picker=None):
     """Render the full dashboard (KPIs + chart + look-back metrics)
     as-of `as_of_t`.  In live mode, `now_utc` is wall-clock and we anchor
     the prediction at the Binance live spot.  In historical mode, `now_utc`
@@ -578,24 +635,23 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
     latest_close = float(df.loc[latest_t, "btc_close"])
     next_t = latest_t + pd.Timedelta(hours=1)
 
-    # Daily H/L forecast — show prediction for the NEXT day's 7am-CT bar:
-    #   Live mode   → as-of bar = today's bar; target = bar starting tomorrow 7am CT.
-    #   Historical  → as-of bar = picked_date's bar; target = bar starting
-    #                 (picked_date + 1) 7am CT.
-    # NOTE: compute_daily_forecast falls back to the latest COMPLETE bar if the
-    # requested as-of bar is still in progress; in that case the displayed
-    # forecast effectively shows "next bar after the latest complete one".
+    # Daily H/L forecast — labelled by the TARGET date (the bar being predicted).
+    # The target bar covers [target 7am CT, target+1 7am CT). Only data through
+    # target 7am CT is used (bars with start ≤ target − 1 day).
+    #   Live mode   → target = "today_CT" (the date for which 7am CT has most
+    #                 recently passed; before 7am CT it stays on the previous day).
+    #   Historical  → target = picked_date (the date the user selected).
     if is_live:
         ref_t = datetime.now(timezone.utc)
-        asof_date = pd.Timestamp((ref_t - timedelta(hours=ANCHOR_HOUR_UTC)).date())
+        target_date = pd.Timestamp((ref_t - timedelta(hours=ANCHOR_HOUR_UTC)).date())
     else:
         picked_date_ct = st.session_state.get("hist_date")
         if picked_date_ct is None:
             ref_t = as_of_t.replace(tzinfo=timezone.utc) if as_of_t.tzinfo is None else as_of_t
-            asof_date = pd.Timestamp((ref_t - timedelta(hours=ANCHOR_HOUR_UTC)).date())
+            target_date = pd.Timestamp((ref_t - timedelta(hours=ANCHOR_HOUR_UTC)).date())
         else:
-            asof_date = pd.Timestamp(picked_date_ct)
-    daily = compute_daily_forecast(asof_date.strftime("%Y-%m-%d"))
+            target_date = pd.Timestamp(picked_date_ct)
+    daily = compute_daily_forecast(target_date.strftime("%Y-%m-%d"))
 
     # Rolling forecast target (now+1h in live, as_of+1h in historical)
     if is_live:
@@ -642,12 +698,14 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
     # ---------- Daily H/L forecast KPIs (12:00-UTC = 7am-CT bars) ----------
     if daily is not None:
         ws = daily["target_window_start"]; we = daily["target_window_end"]
+        td = pd.Timestamp(daily["target_date"])
         st.markdown(
-            f"#### 🗓️ Daily H/L forecast — window **{ws.strftime('%Y-%m-%d %H:%M')} → {we.strftime('%Y-%m-%d %H:%M')} UTC**  "
-            f"(= today 7am CT → tomorrow 7am CT)  "
-            f"<small>(issued from bar starting "
-            f"{daily['as_of_date'].strftime('%Y-%m-%d')} 12:00 UTC, close "
-            f"${daily['close_asof']:,.0f} — refreshes at 12:00 UTC (7am CT) each day. "
+            f"#### 🗓️ Daily H/L forecast for **{td.strftime('%Y-%m-%d')}** — "
+            f"window **{ws.strftime('%Y-%m-%d %H:%M')} → {we.strftime('%Y-%m-%d %H:%M')} UTC**  "
+            f"(= {td.strftime('%Y-%m-%d')} 7am CT → {(td + pd.Timedelta(days=1)).strftime('%Y-%m-%d')} 7am CT)  "
+            f"<small>(uses data through {td.strftime('%Y-%m-%d')} 7am CT — i.e. "
+            f"the bar starting {daily['as_of_date'].strftime('%Y-%m-%d')} 12:00 UTC, close "
+            f"${daily['close_asof']:,.0f}. Refreshes at 12:00 UTC (7am CT) each day. "
             f"Model: ensemble (Huber+Bayes+GBM-MAE). "
             f"Backtest MAPE H=1.12%, L=1.31%; hit ±1% on 54–60% of test days.)</small>",
             unsafe_allow_html=True,
@@ -665,31 +723,55 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
         d2.caption(
             f"±1.5 % band ${daily['pred_low']*0.985:,.0f} – ${daily['pred_low']*1.015:,.0f}"
         )
+        # Direction-head bias (if model artefact has one)
+        pb = daily.get("p_bull")
+        if pb is not None:
+            pred_asym = (daily["pred_high"] - daily["close_asof"]) \
+                        - (daily["close_asof"] - daily["pred_low"])
+            bias_word = "bullish" if pred_asym > 0 else ("bearish" if pred_asym < 0 else "neutral")
+            bias_color = "#1a7f37" if pred_asym > 0 else ("#b91c1c" if pred_asym < 0 else "#555")
+            be = daily.get("beta_eff")
+            be_str = (f" · β_eff = <b>{be:.2f}</b>" if be is not None else "")
+            st.markdown(
+                f"<small>🧭 <b>Direction head</b>: "
+                f"P(bullish bar) = <b>{pb*100:.1f}%</b> · "
+                f"resulting bias = <span style='color:{bias_color}'><b>{bias_word}</b></span> "
+                f"(predicted up-tail − down-tail = ${pred_asym:+,.0f})"
+                f"{be_str}</small>",
+                unsafe_allow_html=True,
+            )
+
+    # ────── Historical picker (date strip, calendar, hour slider,
+    # bookmarks) rendered RIGHT ABOVE the plots so the user can navigate
+    # to a different day without scrolling back up.
+    if hist_picker is not None:
+        hist_picker()
 
     # ─────────────────────────── walk-forward look-back ───────────────────
     # Live mode  → last LOOKBACK_HOURS hours up to now.
-    # Historical → fixed 24h CT day: [7am CT picked_date, 7am CT picked_date+1].
+    # Historical → fixed 24h bar [picked_date 12:00 UTC, +24h), matching the
+    # daily model's anchor exactly. That is 7am CDT (summer) / 6am CST (winter)
+    # — labelled loosely as "7am CT" per README §"Day-boundary contract".
+    # Anchoring at 12:00 UTC (not DST-following local 7am) ensures the hourly
+    # chart's 24h window covers the same bar the daily prediction is for.
     if is_live:
         look_idx = F_filled.index[(F_filled.index <= latest_t) & valid_mask][-LOOKBACK_HOURS:]
         win_start_utc = None  # signals to chart code: use look_idx-derived range
         win_end_utc   = None
     else:
         _CT = "America/Chicago"
-        # Use the date the user explicitly picked (from the day strip / calendar).
-        # The slider may sit past midnight CT, but the chart window stays
-        # anchored to picked_date so it always represents the same CT bar.
         picked_date_ct = st.session_state.get("hist_date")
         if picked_date_ct is None:
             picked_date_ct = (latest_t.tz_localize("UTC")
                                        .tz_convert(_CT).tz_localize(None).date())
-        day_start_ct = pd.Timestamp(picked_date_ct) + pd.Timedelta(hours=7)
-        day_end_ct   = day_start_ct + pd.Timedelta(days=1)
-        win_start_utc = (day_start_ct
-                         .tz_localize(_CT, ambiguous=True, nonexistent="shift_forward")
-                         .tz_convert("UTC").tz_localize(None))
-        win_end_utc = (day_end_ct
-                       .tz_localize(_CT, ambiguous=True, nonexistent="shift_forward")
-                       .tz_convert("UTC").tz_localize(None))
+        # Fixed 12:00 UTC anchor — same boundary as _rebucket_12utc / daily model.
+        win_start_utc = pd.Timestamp(picked_date_ct) + pd.Timedelta(hours=ANCHOR_HOUR_UTC)
+        win_end_utc   = win_start_utc + pd.Timedelta(days=1)
+        # CT-time edges for the chart's x-axis range (DST-correct labels).
+        day_start_ct = (win_start_utc.tz_localize("UTC").tz_convert(_CT)
+                                     .tz_localize(None))
+        day_end_ct   = (win_end_utc.tz_localize("UTC").tz_convert(_CT)
+                                   .tz_localize(None))
         look_idx = F_filled.index[(F_filled.index >= win_start_utc) &
                                   (F_filled.index <  win_end_utc) &
                                   valid_mask]
@@ -829,6 +911,8 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
     )
 
     # --- Daily H/L forecast: full-width flat threshold lines + CI ---
+    actual_hi_now = None
+    actual_lo_now = None
     if daily is not None:
         wstart = pd.Timestamp(daily["target_window_start"])
         wend   = pd.Timestamp(daily["target_window_end"])
@@ -884,6 +968,43 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
                 annotation_font=dict(color="red", size=10),
             )
 
+        # --- Realised daily HIGH / LOW for the displayed bar (historical
+        # mode only; the live target bar may still be in progress). Solid
+        # lines distinguish realised from the dotted predicted thresholds.
+        if not is_live:
+            try:
+                _daily_raw = _fetch_daily_raw()
+                _tgt = pd.Timestamp(daily["target_date"]).normalize()
+                if _tgt in _daily_raw.index:
+                    _ah = _daily_raw.loc[_tgt, "btc_high"]
+                    _al = _daily_raw.loc[_tgt, "btc_low"]
+                    if pd.notna(_ah) and pd.notna(_al):
+                        actual_hi_now = float(_ah)
+                        actual_lo_now = float(_al)
+            except Exception:
+                pass
+        if actual_hi_now is not None:
+            fig.add_hline(
+                y=actual_hi_now,
+                line=dict(color="darkgreen", width=2, dash="solid"),
+                annotation_text=f"Actual HIGH ${actual_hi_now:,.0f}",
+                annotation_position="top left",
+                annotation_font=dict(color="darkgreen", size=11),
+                annotation_bgcolor="rgba(255,255,255,0.92)",
+                annotation_bordercolor="darkgreen",
+                annotation_borderwidth=1,
+            )
+            fig.add_hline(
+                y=actual_lo_now,
+                line=dict(color="darkred", width=2, dash="solid"),
+                annotation_text=f"Actual LOW ${actual_lo_now:,.0f}",
+                annotation_position="bottom left",
+                annotation_font=dict(color="darkred", size=11),
+                annotation_bgcolor="rgba(255,255,255,0.92)",
+                annotation_bordercolor="darkred",
+                annotation_borderwidth=1,
+            )
+
     # --- Live spot price marker (Binance, current second) ---
     if live_spot is not None:
         fig.add_trace(go.Scatter(
@@ -927,6 +1048,8 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
     if live_spot is not None: y_pts.append(live_spot)
     if daily is not None:
         y_pts.extend([daily["pred_high"], daily["pred_low"]])
+    if actual_hi_now is not None:
+        y_pts.extend([actual_hi_now, actual_lo_now])
     y_min, y_max = min(y_pts), max(y_pts)
     y_pad = max((y_max - y_min) * 0.10, y_max * 0.003)  # ≥0.3% breathing room
     fig.update_yaxes(range=[y_min - y_pad, y_max + y_pad])
@@ -955,29 +1078,28 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
                     key=f"chart_hourly_{'live' if is_live else 'hist'}")
 
     # ═══════ NEW PLOT — Daily H/L: last 7 days predictions + actuals ═══════
-    # end_target = the NEXT day after live/picked, so the rightmost "next-day
-    # forecast" point is the bar starting one day AHEAD:
-    #   Live      → tomorrow's bar (today's bar + 1 day).
-    #   Historical → bar starting on picked_date + 1 (matches the KPI card).
+    # end_target = the rightmost target date — the bar STARTING on this date
+    # is the one highlighted as the current forecast:
+    #   Live      → today_CT's bar (starts today 7am CT, ends tomorrow 7am CT).
+    #   Historical → bar starting on picked_date (matches the KPI card).
     if is_live:
         end_target = pd.Timestamp(
             (datetime.now(timezone.utc) - timedelta(hours=ANCHOR_HOUR_UTC)).date()
-        ) + pd.Timedelta(days=1)
+        )
     else:
         picked_date_ct = st.session_state.get("hist_date")
         if picked_date_ct is not None:
-            end_target = pd.Timestamp(picked_date_ct) + pd.Timedelta(days=1)
+            end_target = pd.Timestamp(picked_date_ct)
         else:
             ref = as_of_t.replace(tzinfo=timezone.utc) if as_of_t.tzinfo is None else as_of_t
-            end_target = pd.Timestamp((ref - timedelta(hours=ANCHOR_HOUR_UTC)).date()) \
-                + pd.Timedelta(days=1)
+            end_target = pd.Timestamp((ref - timedelta(hours=ANCHOR_HOUR_UTC)).date())
     series = compute_daily_series(end_target.strftime("%Y-%m-%d"), days_back=7)
 
     if len(series) > 0:
         st.markdown(
             f"#### 📈 Daily H/L — predictions vs actuals "
-            f"(last 7 bars + next-bar forecast; bar opens 12:00 UTC = 7am CT, "
-            f"latest target starts **{end_target.strftime('%Y-%m-%d')}**)"
+            f"(last 7 bars + current target; each bar opens 12:00 UTC = 7am CT, "
+            f"highlighted target = **{end_target.strftime('%Y-%m-%d')}**)"
         )
         fig2 = go.Figure()
         # Predicted HIGH line
@@ -1022,32 +1144,110 @@ def render_dashboard(as_of_t, *, is_live, live_spot=None, live_spot_ts=None):
                                "Actual LOW $%{y:,.0f}<extra></extra>"),
             ))
 
-        # Highlight the right-most point (the next-day forecast)
+        # Direction-correctness per day, computed SEPARATELY for HIGH and LOW.
+        # For each day D, compare the day-over-day MOVE of the plotted lines:
+        #   HIGH direction realised  = sign(actual_high[D] − actual_high[D-1])
+        #   HIGH direction predicted = sign(pred_high[D]   − pred_high[D-1])
+        #   LOW  direction realised  = sign(actual_low[D]  − actual_low[D-1])
+        #   LOW  direction predicted = sign(pred_low[D]    − pred_low[D-1])
+        # Match iff signs agree. This reflects what's visible in the chart:
+        # did the predicted line trend the same way as the realised line?
+        dir_hit_str = ""
+        yest_act_hi  = series["actual_high"].shift(1)
+        yest_act_lo  = series["actual_low"].shift(1)
+        yest_pred_hi = series["pred_high"].shift(1)
+        yest_pred_lo = series["pred_low"].shift(1)
+        d_hi_act  = series["actual_high"] - yest_act_hi
+        d_lo_act  = series["actual_low"]  - yest_act_lo
+        d_hi_pred = series["pred_high"]   - yest_pred_hi
+        d_lo_pred = series["pred_low"]    - yest_pred_lo
+        have_hi = (yest_act_hi.notna() & series["actual_high"].notna()
+                   & yest_pred_hi.notna() & series["pred_high"].notna())
+        have_lo = (yest_act_lo.notna() & series["actual_low"].notna()
+                   & yest_pred_lo.notna() & series["pred_low"].notna())
+        correct_hi = (np.sign(d_hi_act) == np.sign(d_hi_pred)) & have_hi & (np.sign(d_hi_act) != 0)
+        correct_lo = (np.sign(d_lo_act) == np.sign(d_lo_pred)) & have_lo & (np.sign(d_lo_act) != 0)
+        if have_hi.any() or have_lo.any():
+            hits_hi = int(correct_hi[have_hi].sum())
+            hits_lo = int(correct_lo[have_lo].sum())
+            n_hi = int(have_hi.sum())
+            n_lo = int(have_lo.sum())
+            dir_hit_str = (
+                f"  <span style='color:#1a7f37'><b>HIGH</b> line-trend hit-rate: "
+                f"{hits_hi}/{n_hi} = {hits_hi/n_hi*100:.0f}%</span> · "
+                f"<span style='color:#b91c1c'><b>LOW</b> line-trend hit-rate: "
+                f"{hits_lo}/{n_lo} = {hits_lo/n_lo*100:.0f}%</span>"
+                if n_hi and n_lo else dir_hit_str
+            )
+            # HIGH row (top, green) and LOW row (slightly below, red)
+            for i in range(len(series)):
+                td_label = series["target_date"].iloc[i].strftime('%Y-%m-%d')
+                if bool(have_hi.iloc[i]):
+                    ok_h = bool(correct_hi.iloc[i])
+                    fig2.add_annotation(
+                        x=series["target_date"].iloc[i], y=1.10,
+                        xref="x", yref="paper",
+                        text=("✓" if ok_h else "✗"),
+                        showarrow=False, yanchor="bottom", xanchor="center",
+                        font=dict(color="seagreen", size=18, family="monospace"),
+                        hovertext=(
+                            f"{td_label} — HIGH day-to-day direction<br>"
+                            f"Pred line: {'up' if d_hi_pred.iloc[i]>0 else 'down' if d_hi_pred.iloc[i]<0 else 'flat'} "
+                            f"(Δ pred_high vs yest pred_high = ${d_hi_pred.iloc[i]:+,.0f})<br>"
+                            f"Actual line: {'up' if d_hi_act.iloc[i]>0 else 'down' if d_hi_act.iloc[i]<0 else 'flat'} "
+                            f"(Δ actual_high vs yest actual_high = ${d_hi_act.iloc[i]:+,.0f})<br>"
+                            f"{'Matched' if ok_h else 'Missed'}"
+                        ),
+                    )
+                if bool(have_lo.iloc[i]):
+                    ok_l = bool(correct_lo.iloc[i])
+                    fig2.add_annotation(
+                        x=series["target_date"].iloc[i], y=1.02,
+                        xref="x", yref="paper",
+                        text=("✓" if ok_l else "✗"),
+                        showarrow=False, yanchor="bottom", xanchor="center",
+                        font=dict(color="indianred", size=18, family="monospace"),
+                        hovertext=(
+                            f"{td_label} — LOW day-to-day direction<br>"
+                            f"Pred line: {'up' if d_lo_pred.iloc[i]>0 else 'down' if d_lo_pred.iloc[i]<0 else 'flat'} "
+                            f"(Δ pred_low vs yest pred_low = ${d_lo_pred.iloc[i]:+,.0f})<br>"
+                            f"Actual line: {'up' if d_lo_act.iloc[i]>0 else 'down' if d_lo_act.iloc[i]<0 else 'flat'} "
+                            f"(Δ actual_low vs yest actual_low = ${d_lo_act.iloc[i]:+,.0f})<br>"
+                            f"{'Matched' if ok_l else 'Missed'}"
+                        ),
+                    )
+
+        # Highlight the right-most point (the target forecast)
         last_t = series["target_date"].iloc[-1]
         fig2.add_vrect(x0=last_t - pd.Timedelta(hours=12),
                        x1=last_t + pd.Timedelta(hours=12),
                        fillcolor="khaki", opacity=0.30, line_width=0,
                        layer="below")
         fig2.add_annotation(
-            x=last_t, y=1.0, xref="x", yref="paper",
-            text=f"<b>next-day forecast</b><br>{last_t.strftime('%Y-%m-%d')}",
+            x=last_t, y=1.18, xref="x", yref="paper",
+            text=f"<b>target forecast</b><br>{last_t.strftime('%Y-%m-%d')}",
             showarrow=False, yanchor="bottom", xanchor="center",
             bgcolor="rgba(255,255,255,0.92)", bordercolor="goldenrod",
             borderwidth=1, font=dict(color="goldenrod", size=10),
         )
 
         fig2.update_layout(
-            template="plotly_white", height=460, hovermode="x unified",
+            template="plotly_white", height=500, hovermode="x unified",
             title=dict(
                 text=("<b>Daily H/L — predictions (dotted) vs actuals (X markers)</b>"
                       "<br><span style='font-size:12px;color:#555'>"
-                      "8 target days: last 7 with realised values + next-day forecast highlighted."
+                      "8 target days: last 7 with realised values + target forecast highlighted. "
+                      "Top rows: <b style='color:#1a7f37'>green</b> = HIGH line "
+                      "day-over-day direction (pred-trend vs actual-trend), "
+                      "<b style='color:#b91c1c'>red</b> = LOW line "
+                      "day-over-day direction. ✓ both lines moved the same way / ✗ opposed."
+                      f"{dir_hit_str}"
                       "</span>"),
-                x=0.01, xanchor="left", y=0.96, yanchor="top",
+                x=0.01, xanchor="left", y=0.97, yanchor="top",
             ),
             yaxis_title="BTC / USD",
             xaxis_title="Target bar start date (US Central, bar opens 7am CT)",
-            margin=dict(t=85, r=200, b=60, l=70),
+            margin=dict(t=140, r=200, b=60, l=70),
             legend=dict(orientation="v", x=1.02, xanchor="left", y=1.0,
                         yanchor="top", bgcolor="rgba(255,255,255,0.95)",
                         bordercolor="#ccc", borderwidth=1, font=dict(size=11)),
@@ -1101,43 +1301,60 @@ with tab_live:
                      live_spot=live_spot, live_spot_ts=live_spot_ts)
 
 with tab_hist:
-    st.markdown("### Pick a historical timestamp to replay the model")
-    st.caption(
-        "Choose any date+hour for which we have hourly data — the dashboard "
-        "below mirrors the Live tab but with all metrics computed AS OF that "
-        "past timestamp.  This lets you see what the model would have predicted "
-        "and how it would have compared to the actual realised values."
-    )
     valid_times = F_filled.index[valid_mask]
     if len(valid_times) < 30:
         st.error("Not enough historical data available yet.")
     else:
-        # Convert the valid-times window into CT so the picker bounds match
-        # the user's selection timezone.
         CT_TZ = "America/Chicago"
         min_t = valid_times.min(); max_t = valid_times.max()
         min_t_ct = min_t.tz_localize("UTC").tz_convert(CT_TZ).tz_localize(None)
         max_t_ct = max_t.tz_localize("UTC").tz_convert(CT_TZ).tz_localize(None)
         min_date = min_t_ct.date()
-        max_date = (max_t_ct - pd.Timedelta(hours=1)).date()
-        # "Today" in CT = the most recent date with available data.
-        today_ct = max_date
-        # On first load, auto-select today.
+        data_max_date = (max_t_ct - pd.Timedelta(hours=1)).date()
+        # Historical replay is for PAST dates only — today's bar is in progress
+        # (it hasn't closed at 7am CT next day yet) so we exclude it.
+        today_ct = pd.Timestamp.now(tz=CT_TZ).date()
+        max_date = min(data_max_date, today_ct - timedelta(days=1))
         if "hist_date" not in st.session_state:
-            st.session_state["hist_date"] = today_ct
+            st.session_state["hist_date"] = max_date
 
-        # Callbacks fire before the script reruns, so updates to
-        # session_state["hist_date"] are reflected when widgets render.
+        # Compute slider bounds from the current picked_date (DST-correct).
+        # Summer: 7am→7am CDT. Winter: 6am→6am CST. Matches the daily model's
+        # 24h bar anchored at 12:00 UTC.
+        picked_date = st.session_state["hist_date"]
+        import datetime as _dt
+        slider_win_start_utc = pd.Timestamp(picked_date) + pd.Timedelta(hours=ANCHOR_HOUR_UTC)
+        slider_win_end_utc   = slider_win_start_utc + pd.Timedelta(days=1)
+        slider_min = (slider_win_start_utc.tz_localize("UTC")
+                      .tz_convert(CT_TZ).tz_localize(None).to_pydatetime())
+        slider_max = (slider_win_end_utc.tz_localize("UTC")
+                      .tz_convert(CT_TZ).tz_localize(None).to_pydatetime())
+        # Sanitize stored hour value if the date changed and it's now out of range.
+        prior = st.session_state.get("hist_hour_ts")
+        if prior is None or not (slider_min <= prior <= slider_max):
+            st.session_state["hist_hour_ts"] = slider_max
+
+        # Pre-compute target_t / actual_t from session state so render_dashboard
+        # can render KPIs FIRST, then the picker, then the plots. (The picker's
+        # widgets read/write the same session_state keys; on user interaction
+        # Streamlit reruns and these recompute consistently for the next pass.)
+        picked_t_ct = pd.Timestamp(st.session_state["hist_hour_ts"])
+        target_t = (picked_t_ct
+                    .tz_localize(CT_TZ, ambiguous=True, nonexistent="shift_forward")
+                    .tz_convert("UTC").tz_localize(None))
+        avail = valid_times[valid_times <= target_t]
+        actual_t = avail[-1] if len(avail) else None
+        actual_t_ct = (actual_t.tz_localize("UTC").tz_convert(CT_TZ).tz_localize(None)
+                       if actual_t is not None else None)
+
+        # Callbacks (closures over min_date/max_date)
         def _shift_date(delta_days):
-            cur = st.session_state.get("hist_date", today_ct)
+            cur = st.session_state.get("hist_date", max_date)
             new = cur + timedelta(days=delta_days)
             st.session_state["hist_date"] = max(min_date, min(max_date, new))
 
         def _select_date(d):
             st.session_state["hist_date"] = max(min_date, min(max_date, d))
-
-        # ───────── Bookmarks (persisted to bookmarks.json) ─────────
-        bookmarks = load_bookmarks()
 
         def _go_to_bookmark(iso_date_str):
             try:
@@ -1146,154 +1363,132 @@ with tab_hist:
             except Exception:
                 pass
 
-        with st.expander(
-            f"🔖 Bookmarks  ({sum(len(v) for v in bookmarks.values())} saved "
-            f"across {len(bookmarks)} categor{'y' if len(bookmarks)==1 else 'ies'})",
-            expanded=bool(bookmarks),
-        ):
-            bk_browse, bk_save = st.columns([1.2, 1])
+        bookmarks = load_bookmarks()
 
-            # — Browse / select existing bookmark —
-            with bk_browse:
-                st.markdown("**Jump to a bookmarked date**")
-                if not bookmarks:
-                    st.caption("_No bookmarks yet. Save the current date on the right._")
-                else:
-                    cat = st.selectbox("Category", sorted(bookmarks.keys()),
-                                       key="bk_cat_pick")
-                    entries = bookmarks.get(cat, [])
-                    if entries:
-                        opt_labels = [
-                            f"{e['date']}" + (f" — {e['label']}" if e.get("label") else "")
-                            for e in entries
-                        ]
-                        idx = st.selectbox(
-                            "Date", range(len(entries)),
-                            format_func=lambda i: opt_labels[i],
-                            key="bk_date_pick",
-                        )
-                        sel = entries[idx]
-                        b1, b2 = st.columns([1, 1])
-                        with b1:
-                            st.button("Go to this date", key="bk_go",
-                                      on_click=_go_to_bookmark, args=(sel["date"],),
-                                      type="primary", use_container_width=True)
-                        with b2:
-                            st.button("🗑 Delete", key="bk_del",
-                                      on_click=lambda c=cat, d=sel["date"]: delete_bookmark(c, d),
-                                      use_container_width=True)
+        def _hist_picker():
+            """Renders date strip, calendar, hour slider, and bookmarks expander.
+            Called from inside render_dashboard so it sits right above the plots."""
+            st.markdown("#### 🕒 Pick a historical date / hour to replay")
 
-            # — Save current pick as a new bookmark —
-            with bk_save:
-                st.markdown("**Save current selection**")
-                cur_d = st.session_state.get("hist_date", today_ct)
-                st.caption(f"Current date: **{cur_d.isoformat()}** (CT)")
-                cats = sorted(bookmarks.keys())
-                cat_choice = st.selectbox(
-                    "Category", options=cats + ["➕ New category…"],
-                    key="bk_save_cat",
+            # ── Day strip: ◀  [-3] [-2] [-1] [SEL] [+1] [+2] [+3]  ▶ ──
+            cur_picked = st.session_state.get("hist_date", max_date)
+            strip_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1, 0.4])
+            with strip_cols[0]:
+                st.button("◀", key="hist_prev_day", help="Previous day",
+                          on_click=_shift_date, args=(-1,),
+                          disabled=(cur_picked <= min_date),
+                          use_container_width=True)
+            for i, offset in enumerate(range(-3, 4)):
+                d = cur_picked + timedelta(days=offset)
+                label = d.strftime("%a\n%b %-d")
+                in_range = (min_date <= d <= max_date)
+                is_selected = (d == cur_picked)
+                with strip_cols[i + 1]:
+                    st.button(
+                        label, key=f"hist_pill_{offset}",
+                        help=d.strftime("%Y-%m-%d (US Central)"),
+                        on_click=_select_date, args=(d,),
+                        disabled=(not in_range),
+                        type=("primary" if is_selected else "secondary"),
+                        use_container_width=True,
+                    )
+            with strip_cols[8]:
+                st.button("▶", key="hist_next_day", help="Next day",
+                          on_click=_shift_date, args=(1,),
+                          disabled=(cur_picked >= max_date),
+                          use_container_width=True)
+
+            # ── Calendar + hour slider side-by-side ──
+            cal_col, slider_col = st.columns([1, 2])
+            with cal_col:
+                st.date_input(
+                    "Or pick from calendar (CT)",
+                    min_value=min_date, max_value=max_date,
+                    key="hist_date",
                 )
-                if cat_choice == "➕ New category…":
-                    new_cat = st.text_input("New category name", key="bk_new_cat",
-                                            placeholder="e.g. Macro events")
-                    final_cat = (new_cat or "").strip()
-                else:
-                    final_cat = cat_choice
-                bk_label = st.text_input("Optional label", key="bk_label",
-                                         placeholder="e.g. FOMC meeting")
-                if st.button("💾 Save bookmark", key="bk_save_btn",
-                             disabled=not final_cat, use_container_width=True):
-                    add_bookmark(final_cat, cur_d, bk_label.strip())
-                    st.success(f"Saved **{cur_d.isoformat()}** to *{final_cat}*")
-                    st.rerun()
-
-        # ── Day strip: ◀  [-3] [-2] [-1] [SELECTED] [+1] [+2] [+3]  ▶ ──
-        picked_date = st.session_state.get("hist_date", today_ct)
-        st.markdown("**Date (US Central)** — click a day, use ◀/▶ to slide, "
-                    "or open the calendar below.")
-        strip_cols = st.columns([0.4, 1, 1, 1, 1, 1, 1, 1, 0.4])
-        with strip_cols[0]:
-            st.button("◀", key="hist_prev_day", help="Previous day",
-                      on_click=_shift_date, args=(-1,),
-                      disabled=(picked_date <= min_date),
-                      use_container_width=True)
-        for i, offset in enumerate(range(-3, 4)):
-            d = picked_date + timedelta(days=offset)
-            label = d.strftime("%a\n%b %-d")
-            in_range = (min_date <= d <= max_date)
-            is_selected = (d == picked_date)
-            with strip_cols[i + 1]:
-                st.button(
-                    label,
-                    key=f"hist_pill_{offset}",
-                    help=d.strftime("%Y-%m-%d (US Central)"),
-                    on_click=_select_date, args=(d,),
-                    disabled=(not in_range),
-                    type=("primary" if is_selected else "secondary"),
-                    use_container_width=True,
+            with slider_col:
+                st.slider(
+                    "Hour (US Central) — 7am picked → 7am next day",
+                    min_value=slider_min, max_value=slider_max,
+                    step=_dt.timedelta(hours=1),
+                    format="MMM D, HH:mm",
+                    key="hist_hour_ts",
                 )
-        with strip_cols[8]:
-            st.button("▶", key="hist_next_day", help="Next day",
-                      on_click=_shift_date, args=(1,),
-                      disabled=(picked_date >= max_date),
-                      use_container_width=True)
 
-        # ── Calendar picker on its own row, hour slider full-width below ──
-        st.date_input(
-            "Or pick from calendar (CT)",
-            min_value=min_date, max_value=max_date,
-            key="hist_date",
-        )
+            # As-of caption (snap if needed)
+            if actual_t is not None:
+                if actual_t != target_t:
+                    st.caption(f"⚠️ Snapped to **{actual_t_ct} CT** ({actual_t} UTC) "
+                               f"— picked {picked_t_ct} CT")
+                else:
+                    st.caption(f"As-of: **{actual_t_ct} CT** ({actual_t} UTC)")
 
-        # Read the canonical selected date back AFTER widgets rendered.
-        picked_date = st.session_state["hist_date"]
+            # ── Bookmarks (collapsed by default since panel is mid-page) ──
+            with st.expander(
+                f"🔖 Bookmarks  ({sum(len(v) for v in bookmarks.values())} saved "
+                f"across {len(bookmarks)} categor{'y' if len(bookmarks)==1 else 'ies'})",
+                expanded=False,
+            ):
+                bk_browse, bk_save = st.columns([1.2, 1])
+                with bk_browse:
+                    st.markdown("**Jump to a bookmarked date**")
+                    if not bookmarks:
+                        st.caption("_No bookmarks yet. Save the current date on the right._")
+                    else:
+                        cat = st.selectbox("Category", sorted(bookmarks.keys()),
+                                           key="bk_cat_pick")
+                        entries = bookmarks.get(cat, [])
+                        if entries:
+                            opt_labels = [
+                                f"{e['date']}" + (f" — {e['label']}" if e.get("label") else "")
+                                for e in entries
+                            ]
+                            idx = st.selectbox(
+                                "Date", range(len(entries)),
+                                format_func=lambda i: opt_labels[i],
+                                key="bk_date_pick",
+                            )
+                            sel = entries[idx]
+                            b1, b2 = st.columns([1, 1])
+                            with b1:
+                                st.button("Go to this date", key="bk_go",
+                                          on_click=_go_to_bookmark, args=(sel["date"],),
+                                          type="primary", use_container_width=True)
+                            with b2:
+                                st.button("🗑 Delete", key="bk_del",
+                                          on_click=lambda c=cat, d=sel["date"]: delete_bookmark(c, d),
+                                          use_container_width=True)
+                with bk_save:
+                    st.markdown("**Save current selection**")
+                    cur_d = st.session_state.get("hist_date", max_date)
+                    st.caption(f"Current date: **{cur_d.isoformat()}** (CT)")
+                    cats = sorted(bookmarks.keys())
+                    cat_choice = st.selectbox(
+                        "Category", options=cats + ["➕ New category…"],
+                        key="bk_save_cat",
+                    )
+                    if cat_choice == "➕ New category…":
+                        new_cat = st.text_input("New category name", key="bk_new_cat",
+                                                placeholder="e.g. Macro events")
+                        final_cat = (new_cat or "").strip()
+                    else:
+                        final_cat = cat_choice
+                    bk_label = st.text_input("Optional label", key="bk_label",
+                                             placeholder="e.g. FOMC meeting")
+                    if st.button("💾 Save bookmark", key="bk_save_btn",
+                                 disabled=not final_cat, use_container_width=True):
+                        add_bookmark(final_cat, cur_d, bk_label.strip())
+                        st.success(f"Saved **{cur_d.isoformat()}** to *{final_cat}*")
+                        st.rerun()
 
-        # Hour slider spans the 24h CT day [7am picked_date, 7am next day]
-        # (25 hourly ticks, inclusive on both ends).
-        import datetime as _dt
-        slider_min = _dt.datetime.combine(picked_date, _dt.time(hour=7))
-        slider_max = slider_min + _dt.timedelta(hours=24)
-        # Reset stored value if the date changed and the old time is out of range
-        prior = st.session_state.get("hist_hour_ts")
-        if prior is None or not (slider_min <= prior <= slider_max):
-            st.session_state["hist_hour_ts"] = slider_max
-        picked_t_ct_dt = st.slider(
-            "Hour (US Central) — 7am of selected date → 7am next day",
-            min_value=slider_min, max_value=slider_max,
-            step=_dt.timedelta(hours=1),
-            format="MMM D, HH:mm",
-            key="hist_hour_ts",
-        )
-
-        # Slider value is a naive CT wall-clock datetime; localize to CT, convert to UTC.
-        # DST handling: spring-forward shifts the missing hour forward; fall-back
-        # ambiguous hour defaults to the earlier (DST) offset.
-        picked_t_ct = pd.Timestamp(picked_t_ct_dt)
-        target_t = (picked_t_ct
-                    .tz_localize(CT_TZ, ambiguous=True, nonexistent="shift_forward")
-                    .tz_convert("UTC")
-                    .tz_localize(None))
-
-        avail = valid_times[valid_times <= target_t]
-        if len(avail) == 0:
+        if actual_t is None:
             st.error(f"No data available at or before {picked_t_ct} CT "
-                     f"(= {target_t} UTC).")
+                     f"(= {target_t} UTC). Pick a different date/hour below.")
+            _hist_picker()
         else:
-            actual_t = avail[-1]
-            actual_t_ct = (actual_t.tz_localize("UTC")
-                                  .tz_convert(CT_TZ).tz_localize(None))
-            if actual_t != target_t:
-                st.warning(
-                    f"Snapped to nearest available timestamp: "
-                    f"**{actual_t_ct} CT** ({actual_t} UTC)  "
-                    f"— picked {picked_t_ct} CT"
-                )
-            else:
-                st.success(
-                    f"As-of timestamp: **{actual_t_ct} CT** ({actual_t} UTC)"
-                )
             render_dashboard(actual_t, is_live=False,
-                             live_spot=None, live_spot_ts=None)
+                             live_spot=None, live_spot_ts=None,
+                             hist_picker=_hist_picker)
 # ─────────────────────── timer-driven re-run ──────────────────────────
 time.sleep(REFRESH_SECONDS)
 st.rerun()
