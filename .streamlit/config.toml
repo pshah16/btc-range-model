@@ -1,0 +1,20 @@
+# Streamlit configuration for cloud deployment
+# https://docs.streamlit.io/develop/api-reference/configuration
+
+[server]
+# Required for Streamlit Community Cloud — disables the local dev welcome screen
+headless = true
+# Do not open a browser tab automatically (no display on cloud)
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+# Opt out of anonymous usage telemetry
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#F7931A"        # Bitcoin orange
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"

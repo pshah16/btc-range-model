@@ -17,8 +17,8 @@ Thumbs.db
 *.log
 /tmp/
 
-# Streamlit
-.streamlit/
+# Streamlit — commit config.toml but never secrets
+.streamlit/secrets.toml
 
 # Large reproducible-from-API/script data — regenerable via src/ scripts
 data/binance_hourly_btc.csv
