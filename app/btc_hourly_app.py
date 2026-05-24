@@ -271,6 +271,12 @@ def _rebucket_12utc(hourly):
 
     Returns bars indexed by start date D. Drops incomplete bars
     (anything other than 24 hours)."""
+    if hourly.empty:
+        # Return an empty frame with the correct columns and a DatetimeIndex
+        # so callers that check .empty or iterate over .index don't crash.
+        g = pd.DataFrame(columns=["open","high","low","close","volume"])
+        g.index = pd.DatetimeIndex([], name="bar_start")
+        return g
     h = hourly.copy()
     h["bucket"] = (h.index - pd.Timedelta(hours=ANCHOR_HOUR_UTC)).normalize()
     g = h.groupby("bucket").agg(
@@ -343,7 +349,11 @@ def _fetch_binance_hourly(days_back=None):
         parts.append(new_df)
 
     if not parts:
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
+        # Return with a DatetimeIndex (not the default RangeIndex) so that
+        # _rebucket_12utc can safely do `h.index - pd.Timedelta(...)`.
+        empty = pd.DataFrame(columns=["open","high","low","close","volume"])
+        empty.index = pd.DatetimeIndex([], name="ts")
+        return empty
     df = pd.concat(parts)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     if days_back is not None and len(df):
@@ -364,6 +374,13 @@ def _fetch_daily_raw():
     Cached 6 h."""
     # 1. BTC 12:00-UTC daily bars (full history → any picked date is fully featured)
     btc_hourly = _fetch_binance_hourly()
+    if btc_hourly.empty:
+        st.error(
+            "⚠️ Could not fetch BTC hourly data from Binance. "
+            "The Binance API may be temporarily unavailable or rate-limiting this server. "
+            "The daily H/L forecast requires this data — please wait a minute and refresh."
+        )
+        st.stop()
     btc_daily = _rebucket_12utc(btc_hourly).add_prefix("btc_")
 
     # 2. Macro daily from Yahoo (calendar-date indexed)
