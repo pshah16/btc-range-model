@@ -322,9 +322,14 @@ def _fetch_binance_hourly(days_back=None):
             batch = r.json()
         except Exception:
             break
-        if not batch: break
+        # Guard: Binance returns an error dict (e.g. rate-limit) instead of a
+        # list of klines — a non-empty dict would pass `if not batch` but then
+        # fail on `batch[-1][0]`.  Also coerce the open-time to int to handle
+        # API versions that return timestamps as strings.
+        if not batch or not isinstance(batch, list) or not isinstance(batch[-1], (list, tuple)):
+            break
         rows.extend(batch)
-        cursor = batch[-1][0] + 3600_000
+        cursor = int(batch[-1][0]) + 3600_000
         time.sleep(0.1)
     if rows:
         cols = ["open_time","open","high","low","close","volume",
