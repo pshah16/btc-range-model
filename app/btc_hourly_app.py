@@ -289,6 +289,39 @@ def _rebucket_12utc(hourly):
     return g
 
 
+def _fetch_yfinance_hourly_fallback():
+    """Fetch BTC 1-hour OHLCV from Yahoo Finance (BTC-USD).
+
+    Used as an automatic fallback when the Binance public API is
+    unavailable or rate-limiting the Streamlit Cloud server.
+    yfinance covers ~730 days of 1-hour bars — enough for all model
+    inference lookbacks (max 90 bars).
+
+    Returns a DataFrame with columns [open, high, low, close, volume]
+    and a UTC-naive DatetimeIndex named 'ts', or an empty frame on failure.
+    """
+    try:
+        raw = yf.download("BTC-USD", period="730d", interval="60m",
+                          progress=False, auto_adjust=False)
+        if raw.empty:
+            raise ValueError("yfinance returned empty data for BTC-USD")
+        # Flatten MultiIndex columns (yfinance sometimes returns them)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [c[0] for c in raw.columns]
+        df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.columns = ["open", "high", "low", "close", "volume"]
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        df.index.name = "ts"
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        return df
+    except Exception:
+        empty = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        empty.index = pd.DatetimeIndex([], name="ts")
+        return empty
+
+
 @st.cache_data(ttl=600, show_spinner="Fetching BTC hourly from Binance …")
 def _fetch_binance_hourly(days_back=None):
     """Return BTC hourly OHLCV with full history.
@@ -349,11 +382,10 @@ def _fetch_binance_hourly(days_back=None):
         parts.append(new_df)
 
     if not parts:
-        # Return with a DatetimeIndex (not the default RangeIndex) so that
-        # _rebucket_12utc can safely do `h.index - pd.Timedelta(...)`.
-        empty = pd.DataFrame(columns=["open","high","low","close","volume"])
-        empty.index = pd.DatetimeIndex([], name="ts")
-        return empty
+        # Binance unavailable (blocked, rate-limited, or no CSV on this host).
+        # Fall back to Yahoo Finance — already a project dependency and works
+        # reliably on Streamlit Community Cloud.
+        return _fetch_yfinance_hourly_fallback()
     df = pd.concat(parts)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     if days_back is not None and len(df):
@@ -376,9 +408,9 @@ def _fetch_daily_raw():
     btc_hourly = _fetch_binance_hourly()
     if btc_hourly.empty:
         st.error(
-            "⚠️ Could not fetch BTC hourly data from Binance. "
-            "The Binance API may be temporarily unavailable or rate-limiting this server. "
-            "The daily H/L forecast requires this data — please wait a minute and refresh."
+            "⚠️ Could not fetch BTC hourly data from Binance **or** Yahoo Finance. "
+            "Both data sources appear to be unavailable right now. "
+            "Please wait a minute and click **Refresh now** in the sidebar."
         )
         st.stop()
     btc_daily = _rebucket_12utc(btc_hourly).add_prefix("btc_")
